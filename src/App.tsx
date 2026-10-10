@@ -41,27 +41,34 @@ interface ServerSharedLocation {
 }
 
 function generateDynamicLinkToken(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let part1 = '';
-  let part2 = '';
-  for (let i = 0; i < 4; i++) {
-    part1 += chars.charAt(Math.floor(Math.random() * chars.length));
-    part2 += chars.charAt(Math.floor(Math.random() * chars.length));
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let code = '';
+  for (let i = 0; i < 7; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  return `${part1}-${part2}`;
+  return code;
+}
+
+function extractTokenFromLocation(): { isRecipient: boolean; token: string } {
+  const pathMatch = window.location.pathname.match(/^\/p\/([a-zA-Z0-9_-]+)/);
+  if (pathMatch) {
+    return { isRecipient: true, token: pathMatch[1] };
+  }
+  const params = new URLSearchParams(window.location.search);
+  const tokenParam = params.get('c') || params.get('token') || '';
+  const isBagikan = params.get('bagikan') === '1' || Boolean(tokenParam);
+  return { isRecipient: isBagikan, token: tokenParam };
 }
 
 export default function App() {
-  // Check if URL has ?bagikan=1 or ?token=... (Recipient Confirmation Page Mode)
+  // Check if URL is /p/<token> or ?c=<token> or ?bagikan=1
   const [isRecipientView, setIsRecipientView] = useState<boolean>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('bagikan') === '1' || Boolean(params.get('token'));
+    return extractTokenFromLocation().isRecipient;
   });
 
   const [recipientName, setRecipientName] = useState<string>('');
   const [recipientToken, setRecipientToken] = useState<string>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('token') || '';
+    return extractTokenFromLocation().token;
   });
   const [gpsLoading, setGpsLoading] = useState<boolean>(false);
   const [gpsError, setGpsError] = useState<string | null>(null);
@@ -70,6 +77,10 @@ export default function App() {
 
   // Main Tracker States
   const [senderLabelForLink, setSenderLabelForLink] = useState<string>('');
+  const [customVercelDomain, setCustomVercelDomain] = useState<string>(() => {
+    const origin = window.location.origin;
+    return origin.includes('.vercel.app') ? origin : origin;
+  });
   const [dynamicToken, setDynamicToken] = useState<string>(() => generateDynamicLinkToken());
   const [tokenGeneratedAt, setTokenGeneratedAt] = useState<string>(() =>
     new Date().toLocaleTimeString('id-ID', {
@@ -86,17 +97,16 @@ export default function App() {
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Build dynamic shareable URL for WhatsApp
+  const isHostedOnVercel = useMemo(() => {
+    return window.location.hostname.endsWith('.vercel.app');
+  }, []);
+
+  // Build clean dynamic shareable URL (/p/<kode>) that automatically uses Vercel domain when deployed
   const shareableLink = useMemo(() => {
-    const baseUrl = window.location.origin + window.location.pathname;
-    const params = new URLSearchParams();
-    params.set('bagikan', '1');
-    params.set('token', dynamicToken);
-    if (senderLabelForLink.trim()) {
-      params.set('kontak', senderLabelForLink.trim());
-    }
-    return `${baseUrl}?${params.toString()}`;
-  }, [dynamicToken, senderLabelForLink]);
+    const rawBase = (customVercelDomain.trim() || window.location.origin).replace(/\/+$/, '');
+    const normalizedBase = /^https?:\/\//i.test(rawBase) ? rawBase : `https://${rawBase}`;
+    return `${normalizedBase}/p/${dynamicToken}`;
+  }, [customVercelDomain, dynamicToken]);
 
   const handleRefreshDynamicLink = () => {
     const newToken = generateDynamicLinkToken();
@@ -107,19 +117,19 @@ export default function App() {
     });
     setDynamicToken(newToken);
     setTokenGeneratedAt(nowTime);
-    setStatusNotice(`Tautan dinamis baru berhasil dibuat (Kode: #${newToken})`);
+    setStatusNotice(`Tautan dinamis baru berhasil dibuat (/p/${newToken})`);
     setTimeout(() => setStatusNotice(null), 3000);
   };
 
   useEffect(() => {
+    const extracted = extractTokenFromLocation();
+    if (extracted.token) {
+      setRecipientToken(extracted.token);
+    }
     const params = new URLSearchParams(window.location.search);
     const kontakParam = params.get('kontak');
-    const tokenParam = params.get('token');
     if (kontakParam && !recipientName) {
       setRecipientName(kontakParam);
-    }
-    if (tokenParam) {
-      setRecipientToken(tokenParam);
     }
   }, []);
 
@@ -427,7 +437,7 @@ export default function App() {
     }
     if (id.startsWith('gps-')) {
       try {
-        await fetch(`/api/shared-locations/${encodeURIComponent(id)}`, {
+        await fetch(`/api/shared-locations?id=${encodeURIComponent(id)}`, {
           method: 'DELETE',
         });
       } catch {
@@ -592,7 +602,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                window.history.replaceState({}, '', window.location.pathname);
+                window.history.replaceState({}, '', '/');
                 setIsRecipientView(false);
               }}
               className="text-slate-900 font-medium hover:underline whitespace-nowrap shrink-0"
@@ -706,26 +716,40 @@ export default function App() {
               </p>
 
               <div className="space-y-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">
-                    Label Nama Kontak / Target (Opsional)
-                  </label>
-                  <input
-                    type="text"
-                    value={senderLabelForLink}
-                    onChange={(e) => setSenderLabelForLink(e.target.value)}
-                    placeholder="Contoh: Andi / Nomor WA Pengirim..."
-                    className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
-                  />
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Domain Tautan ({isHostedOnVercel ? 'Otomatis Vercel Aktif' : 'Otomatis menyesuikan Vercel'})
+                    </label>
+                    <input
+                      type="text"
+                      value={customVercelDomain}
+                      onChange={(e) => setCustomVercelDomain(e.target.value)}
+                      placeholder="https://nama-project.vercel.app"
+                      className="w-full px-3 py-2 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Label Nama Kontak / Target (Opsional)
+                    </label>
+                    <input
+                      type="text"
+                      value={senderLabelForLink}
+                      onChange={(e) => setSenderLabelForLink(e.target.value)}
+                      placeholder="Contoh: Andi / Nomor WA..."
+                      className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
+                    />
+                  </div>
                 </div>
 
                 <div>
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <label className="block text-xs font-medium text-slate-700">
-                      Tautan Konfirmasi Lokasi Dinamis
+                      Tautan Ringkas Dinamis (`/p/{dynamicToken}`)
                     </label>
                     <span className="text-[11px] font-mono tabular-nums text-slate-500">
-                      Token: #{dynamicToken} · {tokenGeneratedAt}
+                      Kode: #{dynamicToken} · {tokenGeneratedAt}
                     </span>
                   </div>
                   <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
@@ -739,7 +763,7 @@ export default function App() {
                       type="button"
                       onClick={handleRefreshDynamicLink}
                       className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                      title="Buat ulang link dinamis dengan kode token baru"
+                      title="Buat ulang link dinamis dengan kode baru"
                     >
                       <RefreshCw className="w-3.5 h-3.5" />
                       <span>Refresh Link</span>

@@ -86,8 +86,16 @@ async function startServer() {
     return res.json({ ok: true });
   });
 
-  // Delete all shared locations
-  app.delete('/api/shared-locations', (_req, res) => {
+  // Delete all shared locations or a specific one via ?id=...
+  app.delete('/api/shared-locations', (req, res) => {
+    const idQuery = typeof req.query.id === 'string' ? req.query.id : '';
+    if (idQuery) {
+      const idx = sharedLocationsStore.findIndex((item) => item.id === idQuery);
+      if (idx !== -1) {
+        sharedLocationsStore.splice(idx, 1);
+      }
+      return res.json({ ok: true });
+    }
     sharedLocationsStore.length = 0;
     return res.json({ ok: true });
   });
