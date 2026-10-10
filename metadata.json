@@ -1,0 +1,10 @@
+{
+  "name": "GeoWA Inspector — Analisis Lokasi & Keamanan Pesan WhatsApp",
+  "description": "Alat ekstraksi koordinat lokasi berbagi WhatsApp, parser riwayat chat (.txt), analisis kode area dan operator nomor telepon, pemeriksa tautan pelacak, serta dokumentasi webhook lokasi WhatsApp Business API.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
