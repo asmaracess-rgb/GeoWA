@@ -32,6 +32,7 @@ interface ServerSharedLocation {
   id: string;
   createdAt: string;
   senderLabel: string;
+  linkToken?: string;
   latitude: number;
   longitude: number;
   accuracyMeters: number | null;
@@ -39,14 +40,29 @@ interface ServerSharedLocation {
   note: string;
 }
 
+function generateDynamicLinkToken(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let part1 = '';
+  let part2 = '';
+  for (let i = 0; i < 4; i++) {
+    part1 += chars.charAt(Math.floor(Math.random() * chars.length));
+    part2 += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `${part1}-${part2}`;
+}
+
 export default function App() {
-  // Check if URL has ?bagikan=1 (Recipient Confirmation Page Mode)
+  // Check if URL has ?bagikan=1 or ?token=... (Recipient Confirmation Page Mode)
   const [isRecipientView, setIsRecipientView] = useState<boolean>(() => {
     const params = new URLSearchParams(window.location.search);
-    return params.get('bagikan') === '1';
+    return params.get('bagikan') === '1' || Boolean(params.get('token'));
   });
 
   const [recipientName, setRecipientName] = useState<string>('');
+  const [recipientToken, setRecipientToken] = useState<string>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('token') || '';
+  });
   const [gpsLoading, setGpsLoading] = useState<boolean>(false);
   const [gpsError, setGpsError] = useState<string | null>(null);
   const [recipientCapturedResult, setRecipientCapturedResult] =
@@ -54,6 +70,14 @@ export default function App() {
 
   // Main Tracker States
   const [senderLabelForLink, setSenderLabelForLink] = useState<string>('');
+  const [dynamicToken, setDynamicToken] = useState<string>(() => generateDynamicLinkToken());
+  const [tokenGeneratedAt, setTokenGeneratedAt] = useState<string>(() =>
+    new Date().toLocaleTimeString('id-ID', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+  );
   const [messageInput, setMessageInput] = useState<string>('');
   const [localSearchResults, setLocalSearchResults] = useState<CoordinateSearchResult[]>([]);
   const [serverResults, setServerResults] = useState<CoordinateSearchResult[]>([]);
@@ -62,22 +86,40 @@ export default function App() {
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Build shareable URL for WhatsApp
+  // Build dynamic shareable URL for WhatsApp
   const shareableLink = useMemo(() => {
     const baseUrl = window.location.origin + window.location.pathname;
     const params = new URLSearchParams();
     params.set('bagikan', '1');
+    params.set('token', dynamicToken);
     if (senderLabelForLink.trim()) {
       params.set('kontak', senderLabelForLink.trim());
     }
     return `${baseUrl}?${params.toString()}`;
-  }, [senderLabelForLink]);
+  }, [dynamicToken, senderLabelForLink]);
+
+  const handleRefreshDynamicLink = () => {
+    const newToken = generateDynamicLinkToken();
+    const nowTime = new Date().toLocaleTimeString('id-ID', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    setDynamicToken(newToken);
+    setTokenGeneratedAt(nowTime);
+    setStatusNotice(`Tautan dinamis baru berhasil dibuat (Kode: #${newToken})`);
+    setTimeout(() => setStatusNotice(null), 3000);
+  };
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const kontakParam = params.get('kontak');
+    const tokenParam = params.get('token');
     if (kontakParam && !recipientName) {
       setRecipientName(kontakParam);
+    }
+    if (tokenParam) {
+      setRecipientToken(tokenParam);
     }
   }, []);
 
@@ -94,8 +136,8 @@ export default function App() {
             createdAt: item.createdAt,
             rawMessage:
               item.accuracyMeters !== null
-                ? `${item.note} (Akurasi GPS ±${item.accuracyMeters} meter)`
-                : item.note,
+                ? `${item.note}${item.linkToken ? ` [Token #${item.linkToken}]` : ''} (Akurasi GPS ±${item.accuracyMeters} meter)`
+                : `${item.note}${item.linkToken ? ` [Token #${item.linkToken}]` : ''}`,
             sender: item.senderLabel,
             messageTime: item.createdAt,
             cleanMessageText: item.note,
@@ -105,8 +147,8 @@ export default function App() {
             locationLabel: item.locationLabel,
             detectionMethod:
               item.accuracyMeters !== null
-                ? `Tautan GPS Browser (±${item.accuracyMeters}m)`
-                : 'Tautan GPS Browser',
+                ? `Tautan GPS${item.linkToken ? ` #${item.linkToken}` : ''} (±${item.accuracyMeters}m)`
+                : `Tautan GPS${item.linkToken ? ` #${item.linkToken}` : ''}`,
           })
         );
         setServerResults(mapped);
@@ -164,9 +206,12 @@ export default function App() {
         const acc = Math.round(position.coords.accuracy || 0);
 
         const resolvedAddr = await reverseGeocodeCoordinates(lat, lng);
+        const activeToken = fromRecipientView
+          ? recipientToken || dynamicToken
+          : dynamicToken;
         const senderName =
           (fromRecipientView ? recipientName : senderLabelForLink).trim() ||
-          'Konfirmasi Tautan GPS WhatsApp';
+          `Tautan #${activeToken}`;
 
         try {
           const response = await fetch('/api/shared-locations', {
@@ -174,6 +219,7 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               senderLabel: senderName,
+              linkToken: activeToken,
               latitude: lat,
               longitude: lng,
               accuracyMeters: acc,
@@ -674,10 +720,15 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">
-                    Tautan Konfirmasi Lokasi Anda
-                  </label>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <label className="block text-xs font-medium text-slate-700">
+                      Tautan Konfirmasi Lokasi Dinamis
+                    </label>
+                    <span className="text-[11px] font-mono tabular-nums text-slate-500">
+                      Token: #{dynamicToken} · {tokenGeneratedAt}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
                     <input
                       type="text"
                       readOnly
@@ -686,8 +737,17 @@ export default function App() {
                     />
                     <button
                       type="button"
+                      onClick={handleRefreshDynamicLink}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      title="Buat ulang link dinamis dengan kode token baru"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Refresh Link</span>
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => handleCopyText(shareableLink, 'copy-link')}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       {copiedId === 'copy-link' ? (
                         <>

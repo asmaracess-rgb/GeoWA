@@ -10,6 +10,7 @@ export interface StoredSharedLocation {
   id: string;
   createdAt: string;
   senderLabel: string;
+  linkToken?: string;
   latitude: number;
   longitude: number;
   accuracyMeters: number | null;
@@ -32,13 +33,17 @@ async function startServer() {
 
   // Save a new consented GPS location
   app.post('/api/shared-locations', (req, res) => {
-    const { senderLabel, latitude, longitude, accuracyMeters, locationLabel, note } = req.body || {};
+    const { senderLabel, linkToken, latitude, longitude, accuracyMeters, locationLabel, note } =
+      req.body || {};
     const lat = Number(latitude);
     const lng = Number(longitude);
 
     if (Number.isNaN(lat) || Number.isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
       return res.status(400).json({ error: 'Koordinat tidak valid' });
     }
+
+    const cleanToken =
+      typeof linkToken === 'string' && linkToken.trim() ? linkToken.trim() : undefined;
 
     const newItem: StoredSharedLocation = {
       id: `gps-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -47,7 +52,13 @@ async function startServer() {
         minute: '2-digit',
         second: '2-digit',
       }),
-      senderLabel: typeof senderLabel === 'string' && senderLabel.trim() ? senderLabel.trim() : 'Konfirmasi GPS Browser',
+      senderLabel:
+        typeof senderLabel === 'string' && senderLabel.trim()
+          ? senderLabel.trim()
+          : cleanToken
+          ? `Tautan #${cleanToken}`
+          : 'Konfirmasi GPS Browser',
+      linkToken: cleanToken,
       latitude: Number(lat.toFixed(6)),
       longitude: Number(lng.toFixed(6)),
       accuracyMeters: typeof accuracyMeters === 'number' ? Math.round(accuracyMeters) : null,
